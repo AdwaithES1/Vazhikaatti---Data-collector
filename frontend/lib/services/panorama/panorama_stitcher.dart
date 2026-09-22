@@ -303,7 +303,7 @@ PanoramaStitchResult _stitchFrames(
   // dilute that into other contributors, but winner-takes-one would display
   // it raw, so the mask is eroded first to keep that fringe out of
   // contention entirely.
-  final erosionKernel = cv.Mat.ones(5, 5, cv.MatType.CV_8UC1);
+  final erosionKernel = cv.Mat.ones(11, 11, cv.MatType.CV_8UC1);
   for (var i = 0; i < n; i++) {
     final m = cv.Mat.fromList(3, 3, cv.MatType.CV_64FC1, _mul(shift, global[i]!));
     final warped = cv.warpPerspective(frames[i].image, m, (canvasWidth, canvasHeight));
