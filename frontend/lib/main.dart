@@ -567,9 +567,6 @@ class _CapturePageState extends State<CapturePage> {
       final result = await PanoramaStitcher.stitch(
         panoramaFrames.map((f) => f.imagePath).toList(),
         output.path,
-        headingsDeg: panoramaFrames
-            .map((f) => f.metadata['heading'] as double?)
-            .toList(),
       );
       final id = const Uuid().v4();
       final saved = (await StorageService().saveImage(
@@ -599,12 +596,8 @@ class _CapturePageState extends State<CapturePage> {
             'descriptor_dimension': PanoramaStitcher.descriptorDimension,
             'keypoint_count': result.keypointCount,
             'reference_image_id': panoramaFrames.first.id,
-            'matching_method': result.sensorFallbackPairs == 0
-                ? 'BFMatcher kNN + Lowe ratio'
-                : 'BFMatcher kNN + Lowe ratio '
-                      '(${result.sensorFallbackPairs} of '
-                      '${panoramaFrames.length - 1} links used compass '
-                      'heading fallback)',
+            'matching_method': 'BFMatcher kNN + Lowe ratio, matched between '
+                'every image pair (order-independent)',
             'ratio_test_threshold': PanoramaStitcher.ratioThreshold,
             'total_matches': result.totalMatches,
             'good_matches': result.goodMatches,
@@ -612,15 +605,26 @@ class _CapturePageState extends State<CapturePage> {
             'ransac_threshold': PanoramaStitcher.ransacThreshold,
             'inlier_count': result.inlierCount,
             'inlier_ratio': result.inlierRatio,
-            // false whenever any link relied on the compass fallback rather
-            // than a validated homography, so this stays a reliable signal
-            // that every seam in the panorama was geometrically verified.
-            'homography_valid': result.sensorFallbackPairs == 0,
+            // Every image placed in the panorama is backed by a validated
+            // homography - there is no non-visual fallback - so this is
+            // always true for a panorama that reached 'completed'.
+            'homography_valid': true,
           },
           createdAt: DateTime.now(),
         ),
       );
-      await _setPanoramaStatus('completed');
+      // Only images with real, verified overlap end up in the panorama; any
+      // others are marked separately rather than silently left as-is.
+      final droppedIds = result.droppedImages
+          .map((oneBased) => panoramaFrames[oneBased - 1].id)
+          .toSet();
+      await _setPanoramaStatus(
+        'completed',
+        onlyIds: panoramaFrames.map((f) => f.id).toSet().difference(droppedIds),
+      );
+      if (droppedIds.isNotEmpty) {
+        await _setPanoramaStatus('excluded_no_overlap', onlyIds: droppedIds);
+      }
       panoramaFrames.clear();
       panoramaId = null;
       unawaited(SyncService().syncPending());
@@ -628,7 +632,8 @@ class _CapturePageState extends State<CapturePage> {
         setState(
           () => status =
               'Panorama saved: $id.jpg (${result.width}x${result.height}) '
-              'from $_panoramaShots images',
+              'from ${result.usedImageCount} of $_panoramaShots images'
+              '${droppedIds.isEmpty ? '' : ' (${droppedIds.length} shared no overlap and were left out)'}',
         );
       }
     } on PanoramaStitchException catch (error) {
@@ -655,9 +660,11 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   /// Updates panorama_status on the stored source frames (fresh DB rows, so
-  /// sync state written meanwhile is preserved).
-  Future<void> _setPanoramaStatus(String value) async {
-    final ids = panoramaFrames.map((f) => f.id).toSet();
+  /// sync state written meanwhile is preserved). Defaults to every frame in
+  /// the current panorama; pass [onlyIds] to update just a subset (e.g. the
+  /// images actually placed vs. the ones dropped for lacking overlap).
+  Future<void> _setPanoramaStatus(String value, {Set<String>? onlyIds}) async {
+    final ids = onlyIds ?? panoramaFrames.map((f) => f.id).toSet();
     final rows = await LocalDatabase.instance.captures(widget.session.id);
     for (final row in rows.where((r) => ids.contains(r.id))) {
       await LocalDatabase.instance.updateCaptureSync(

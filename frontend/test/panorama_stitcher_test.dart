@@ -52,9 +52,8 @@ List<String> _renderViews(Directory dir, {int skipTexture = -1}) {
 /// Same 8-view sweep, but the view at [swapIndex] is rendered from a second,
 /// unrelated textured scene instead of the shared one - individually rich in
 /// SIFT keypoints (so `_prepare`'s per-image check still passes), but with
-/// genuinely no correspondence to its neighbours (so pairwise matching
-/// against it should fail on its own merits, exercising the compass
-/// fallback).
+/// genuinely no correspondence to its neighbours, exercising the "drop what
+/// doesn't connect" path instead of forcing it into the panorama.
 List<String> _renderViewsWithSwap(Directory dir, int swapIndex) {
   const w = 480, h = 640;
   final f = (w / 2) / math.tan(30 * math.pi / 180); // 60° horizontal FOV
@@ -105,13 +104,6 @@ List<String> _renderViewsWithSwap(Directory dir, int swapIndex) {
   return paths;
 }
 
-/// Headings matching this file's synthetic `yaw` convention: the renderer's
-/// increasing yaw and the compass fallback's calibrated sign (derived
-/// separately, against real captured images - see panorama_stitcher.dart)
-/// are opposite, so the equivalent "heading" for view k here is -k*45.
-List<double?> _headingsForYawConvention(int count) =>
-    [for (var k = 0; k < count; k++) -k * 45.0];
-
 void main() {
   late Directory dir;
   setUp(() => dir = Directory.systemTemp.createTempSync('pano_test'));
@@ -127,10 +119,23 @@ void main() {
     expect(img.cols, result.width);
     expect(img.cols, greaterThan(480 * 3));
     expect(result.inlierCount, greaterThan(0));
+    expect(result.usedImageCount, 8);
+    expect(result.droppedImages, isEmpty);
     // originals untouched
     for (final v in views) {
       expect(File(v).existsSync(), isTrue);
     }
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
+  test('the same 8 views in shuffled, arbitrary order stitch the same way', () async {
+    final views = _renderViews(dir)..shuffle(math.Random(3));
+    final out = p.join(dir.path, 'pano.jpg');
+    final result = await PanoramaStitcher.stitch(views, out);
+    final img = cv.imread(out);
+    expect(img.isEmpty, isFalse);
+    expect(img.cols, greaterThan(480 * 3));
+    expect(result.usedImageCount, 8);
+    expect(result.droppedImages, isEmpty);
   }, timeout: const Timeout(Duration(minutes: 3)));
 
   test('a textureless frame fails with the failing image identified', () async {
@@ -151,23 +156,17 @@ void main() {
   }, timeout: const Timeout(Duration(minutes: 3)));
 
   test(
-    'a genuinely unrelated frame stitches via the compass fallback when headings are supplied',
+    'a genuinely unrelated image is dropped rather than failing the whole panorama',
     () async {
       final views = _renderViewsWithSwap(dir, 4);
       final out = p.join(dir.path, 'pano.jpg');
-      final result = await PanoramaStitcher.stitch(
-        views,
-        out,
-        headingsDeg: _headingsForYawConvention(views.length),
-      );
+      final result = await PanoramaStitcher.stitch(views, out);
       expect(File(out).existsSync(), isTrue);
       final img = cv.imread(out);
       expect(img.isEmpty, isFalse);
-      // Still spreads the frames out into a wide panorama rather than
-      // collapsing them on top of each other, which is what a wrong fallback
-      // sign would produce.
       expect(img.cols, greaterThan(480 * 3));
-      expect(result.sensorFallbackPairs, greaterThanOrEqualTo(1));
+      expect(result.usedImageCount, 7);
+      expect(result.droppedImages, [5]); // 1-based: swapIndex 4 -> image 5
       for (final v in views) {
         expect(File(v).existsSync(), isTrue);
       }
@@ -176,18 +175,15 @@ void main() {
   );
 
   test(
-    'the same unrelated frame fails without headings, naming the first broken pair',
+    'nothing connects at all throws instead of producing a meaningless image',
     () async {
+      // view 0 (scene A) and view 4 (scene B) share no overlap by construction.
       final views = _renderViewsWithSwap(dir, 4);
       final out = p.join(dir.path, 'pano.jpg');
       await expectLater(
-        PanoramaStitcher.stitch(views, out),
-        throwsA(isA<PanoramaStitchException>().having((e) => e.pair, 'pair', 4)),
+        PanoramaStitcher.stitch([views[0], views[4]], out),
+        throwsA(isA<PanoramaStitchException>().having((e) => e.stage, 'stage', 'matching')),
       );
-      expect(File(out).existsSync(), isFalse);
-      for (final v in views) {
-        expect(File(v).existsSync(), isTrue);
-      }
     },
     timeout: const Timeout(Duration(minutes: 3)),
   );

@@ -7,10 +7,6 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 /// result. For the single-image stages (`load`, `features`), [pair] is the
 /// 1-based index of the failing image itself. For every other stage it is the
 /// 1-based index of the image pair (image `pair` and `pair + 1`).
-///
-/// A pairwise (`matching`/`ransac`/`homography`) failure is only raised when
-/// the compass-heading fallback also could not be used for that pair (no
-/// heading recorded for one of the two images) - see [PanoramaStitcher.stitch].
 class PanoramaStitchException implements Exception {
   const PanoramaStitchException(this.stage, this.message, {this.pair});
   final String stage;
@@ -36,7 +32,8 @@ class PanoramaStitchResult {
     required this.totalMatches,
     required this.goodMatches,
     required this.inlierCount,
-    required this.sensorFallbackPairs,
+    required this.usedImageCount,
+    required this.droppedImages,
   });
   final String path;
   final int width;
@@ -45,32 +42,35 @@ class PanoramaStitchResult {
   final int totalMatches;
   final int goodMatches;
   final int inlierCount;
-  /// Number of links (out of images.length - 1) in the final assembly that
-  /// could not be backed by a validated SIFT/RANSAC homography and were
-  /// instead placed using the compass heading recorded for each image. 0
-  /// means every image was connected to the rest by real, verified overlap.
-  final int sensorFallbackPairs;
+  /// How many of the input images were actually placed in the panorama.
+  final int usedImageCount;
+  /// 1-based indices of images that shared no verified overlap - directly or
+  /// through any other image - with the rest, and so were left out rather
+  /// than forced into the panorama or failing the whole stitch.
+  final List<int> droppedImages;
   double get inlierRatio => goodMatches == 0 ? 0 : inlierCount / goodMatches;
 }
 
-/// Classical panorama stitching:
-/// cylindrical pre-warp → SIFT → kNN descriptor matching → Lowe ratio test →
-/// RANSAC homography, tried between every pair of images (not just adjacent
-/// ones - two images that were not captured back-to-back can still share
-/// real overlap) → the validated pairs form a graph; each image is placed by
-/// composing homographies along the strongest available path back to image 0
-/// → perspective warp → distance-weighted (feather) blending → crop to the
+/// Stitches an unordered set of images taken around one point into a single
+/// 360°-style panorama, purely from image content - no assumption about
+/// capture order or any sensor reading:
+///
+/// cylindrical pre-warp (so a pure rotation becomes a horizontal pixel shift)
+/// → SIFT → kNN descriptor matching → Lowe ratio test → RANSAC homography,
+/// tried between *every* pair of images, not just some assumed sequence →
+/// the validated pairs form a graph, from which the true circular
+/// arrangement emerges: each image is placed by composing homographies along
+/// the strongest available path back to a reference image within its
+/// connected component → perspective warp → winner-takes-one compositing
+/// (the single most reliable source per pixel, not an average) → crop to the
 /// largest fully-covered rectangle.
 ///
-/// An image with no validated path to the rest (or a whole component that
-/// isn't reachable from image 0) is instead linked to its immediate neighbour
-/// in capture order using the compass heading already recorded for both (a
-/// pure horizontal shift in the cylindrical projection, since a heading
-/// difference is exactly the yaw rotation the projection already linearises
-/// into pixels). This still uses only the existing compass sensor already
-/// collected for every capture. The pipeline only fails outright when a
-/// needed heading is missing, or a whole image can't be decoded or has
-/// essentially no texture at all.
+/// An image that shares no validated overlap with anything else - directly
+/// or transitively - cannot be placed by evidence and is left out of the
+/// panorama rather than guessed at or failing the whole stitch; see
+/// [PanoramaStitchResult.droppedImages]. The pipeline only fails outright
+/// when fewer than 2 images end up connected to each other, or a whole image
+/// can't be decoded or has essentially no texture at all.
 class PanoramaStitcher {
   static const ratioThreshold = 0.75;
   static const ransacThreshold = 3.0;
@@ -82,27 +82,21 @@ class PanoramaStitcher {
   // Phone cameras are ~60° wide; used only for the cylindrical pre-warp.
   static const _assumedHorizontalFov = 60 * math.pi / 180;
 
-  /// Stitches [imagePaths] (ordered by capture angle) into one JPEG at
-  /// [outputPath]. [headingsDeg], if given, must be the same length as
-  /// [imagePaths] - the compass heading (degrees) recorded for each image, or
-  /// null for images without one; it is only consulted as a fallback for
-  /// images with no validated visual link to the rest. Runs in a background
-  /// isolate; throws [PanoramaStitchException] on any failure.
+  /// Stitches [imagePaths] - in any order - into one JPEG at [outputPath].
+  /// Runs in a background isolate; throws [PanoramaStitchException] if fewer
+  /// than 2 images end up connected, or an individual image can't be used.
   static Future<PanoramaStitchResult> stitch(
     List<String> imagePaths,
-    String outputPath, {
-    List<double?>? headingsDeg,
-  }) => Isolate.run(() => _stitch(imagePaths, outputPath, headingsDeg));
+    String outputPath,
+  ) => Isolate.run(() => _stitch(imagePaths, outputPath));
 }
 
 class _Frame {
-  _Frame(this.image, this.mask, this.keypoints, this.descriptors, this.f, this.headingDeg);
+  _Frame(this.image, this.mask, this.keypoints, this.descriptors);
   final cv.Mat image;
   final cv.Mat mask;
   final cv.VecKeyPoint keypoints;
   final cv.Mat descriptors;
-  final double f;
-  final double? headingDeg;
 }
 
 /// Result of matching+RANSAC for one pair, before the caller decides whether
@@ -131,25 +125,15 @@ class _Edge {
   final int inliers;
 }
 
-PanoramaStitchResult _stitch(
-  List<String> paths,
-  String outputPath,
-  List<double?>? headingsDeg,
-) {
+PanoramaStitchResult _stitch(List<String> paths, String outputPath) {
   if (paths.length < 2) {
     throw const PanoramaStitchException('input', 'At least 2 images required');
-  }
-  if (headingsDeg != null && headingsDeg.length != paths.length) {
-    throw const PanoramaStitchException(
-      'input',
-      'headingsDeg must be the same length as imagePaths',
-    );
   }
   final sift = cv.SIFT.create(nfeatures: 4000);
   final matcher = cv.BFMatcher.create(type: cv.NORM_L2);
   final frames = <_Frame>[];
   try {
-    return _stitchFrames(paths, outputPath, headingsDeg, sift, matcher, frames);
+    return _stitchFrames(paths, outputPath, sift, matcher, frames);
   } finally {
     // Runs on every exit path (success or a PanoramaStitchException), so a
     // failed/retried stitch never leaks the native Mats/keypoints/descriptors
@@ -166,100 +150,125 @@ PanoramaStitchResult _stitch(
 PanoramaStitchResult _stitchFrames(
   List<String> paths,
   String outputPath,
-  List<double?>? headingsDeg,
   cv.SIFT sift,
   cv.BFMatcher matcher,
   List<_Frame> frames,
 ) {
   var keypointCount = 0;
   for (var i = 0; i < paths.length; i++) {
-    final frame = _prepare(paths[i], i + 1, sift, headingsDeg?[i]);
+    final frame = _prepare(paths[i], i + 1, sift);
     keypointCount += frame.keypoints.length;
     frames.add(frame);
   }
   final n = frames.length;
 
-  // Try every pair, not just adjacent ones - two images that weren't
-  // captured back-to-back can still genuinely overlap, and skipping that
-  // means throwing away real evidence.
+  // Try every pair - with no assumed order, "adjacent" means nothing; the
+  // true arrangement can only come from checking all of them. Each pair is
+  // checked in both directions (which image is "query" vs "train" for
+  // matching, and "src" vs "dst" for RANSAC), and only kept when *both*
+  // directions independently validate. That choice is not perfectly
+  // symmetric in practice - checking only one, keyed off array index, would
+  // make the result depend on the order the caller happened to pass images
+  // in - but accepting whichever direction happens to pass let through a
+  // one-off asymmetric false positive that blew up the canvas; requiring
+  // agreement from two independent RANSAC fits is both order-independent and
+  // safer than either alone.
   final edges = <_Edge>[];
   var totalMatches = 0;
   for (var lower = 0; lower < n; lower++) {
     for (var higher = lower + 1; higher < n; higher++) {
-      final attempt = _matchAndValidate(frames[higher], frames[lower], matcher);
-      totalMatches += attempt.totalMatches;
-      if (attempt.homography != null) {
-        edges.add(_Edge(lower, higher, attempt.homography!, attempt.good, attempt.inliers));
+      final forward = _matchAndValidate(frames[higher], frames[lower], matcher);
+      final backward = _matchAndValidate(frames[lower], frames[higher], matcher);
+      totalMatches += forward.totalMatches + backward.totalMatches;
+      if (forward.homography == null || backward.homography == null) continue;
+      if (forward.inliers >= backward.inliers) {
+        edges.add(_Edge(lower, higher, forward.homography!, forward.good, forward.inliers));
+      } else {
+        // backward.homography maps lower -> higher; store as higher -> lower.
+        edges.add(_Edge(
+          lower,
+          higher,
+          _invert3x3(backward.homography!),
+          backward.good,
+          backward.inliers,
+        ));
       }
     }
   }
 
-  // Build a maximum-spanning forest (by inlier count) over the validated
-  // edges: the strongest available evidence connecting each pair of images
-  // that share any overlap at all, directly or through others.
-  edges.sort((a, b) => b.inliers.compareTo(a.inliers));
+  // Connected components over every validated edge, regardless of strength,
+  // to find which images share any real evidence with which others at all.
   final componentOf = List<int>.generate(n, (i) => i);
   int find(int i) => componentOf[i] == i ? i : componentOf[i] = find(componentOf[i]);
-  final adjacency = List.generate(n, (_) => <_Edge>[]);
   for (final edge in edges) {
     final a = find(edge.lower), b = find(edge.higher);
+    if (a != b) componentOf[a] = b;
+  }
+  final membersOf = <int, List<int>>{};
+  for (var i = 0; i < n; i++) {
+    membersOf.putIfAbsent(find(i), () => []).add(i);
+  }
+  final mainRoot = membersOf.entries.reduce((a, b) => a.value.length >= b.value.length ? a : b).key;
+  final placed = membersOf[mainRoot]!..sort();
+  final dropped = [
+    for (var i = 0; i < n; i++)
+      if (find(i) != mainRoot) i + 1,
+  ];
+  if (placed.length < 2) {
+    throw const PanoramaStitchException(
+      'matching',
+      'no two images share enough verified overlap to build a panorama',
+    );
+  }
+  final placedSet = placed.toSet();
+
+  // Within the main component, build a maximum-spanning tree (by inlier
+  // count) so each image is placed via its strongest available evidence.
+  final treeEdges = <_Edge>[
+    for (final edge in edges)
+      if (placedSet.contains(edge.lower)) edge,
+  ]..sort((a, b) => b.inliers.compareTo(a.inliers));
+  final treeOf = List<int>.generate(n, (i) => i);
+  int findTree(int i) => treeOf[i] == i ? i : treeOf[i] = findTree(treeOf[i]);
+  final adjacency = List.generate(n, (_) => <_Edge>[]);
+  for (final edge in treeEdges) {
+    final a = findTree(edge.lower), b = findTree(edge.higher);
     if (a != b) {
-      componentOf[a] = b;
+      treeOf[a] = b;
       adjacency[edge.lower].add(edge);
       adjacency[edge.higher].add(edge);
     }
   }
 
-  // Place every image: walk in capture order, expanding each image's whole
-  // vision-connected component (via the tree edges above) as soon as any
-  // member of it is reached; a component with no validated path back to an
-  // already-placed image is instead glued to its immediate predecessor by
-  // compass heading.
+  // Place every image in the main component by composing homographies along
+  // the tree from a single reference image - the exact arrangement (which
+  // image ends up where, and in what order) falls out of this evidence, not
+  // from the order the images were passed in.
   final global = List<List<double>?>.filled(n, null);
-  var goodMatches = 0, inlierCount = 0, sensorFallbackPairs = 0;
-  global[0] = _identity;
-  for (var k = 0; k < n; k++) {
-    if (global[k] == null) {
-      final headingCur = frames[k].headingDeg;
-      final headingPrev = frames[k - 1].headingDeg;
-      if (headingCur == null || headingPrev == null) {
-        throw PanoramaStitchException(
-          'matching',
-          'images $k and ${k + 1} share no validated overlap with each other '
-              'or the rest of the panorama, and at least one has no compass '
-              'heading recorded to fall back on',
-          pair: k,
-        );
-      }
-      global[k] = _mul(
-        global[k - 1]!,
-        _compassHomography(frames[k - 1].f, headingPrev, headingCur),
-      );
-      sensorFallbackPairs++;
-    }
-    // Breadth-first expansion of k's vision-connected component.
-    final queue = <int>[k];
-    while (queue.isNotEmpty) {
-      final current = queue.removeAt(0);
-      for (final edge in adjacency[current]) {
-        final other = edge.lower == current ? edge.higher : edge.lower;
-        if (global[other] != null) continue;
-        // hHigherToLower maps higher -> lower; we need other -> current.
-        final hOtherToCurrent = other == edge.higher
-            ? edge.hHigherToLower
-            : _invert3x3(edge.hHigherToLower);
-        global[other] = _mul(global[current]!, hOtherToCurrent);
-        goodMatches += edge.good;
-        inlierCount += edge.inliers;
-        queue.add(other);
-      }
+  var goodMatches = 0, inlierCount = 0;
+  final reference = placed.first;
+  global[reference] = _identity;
+  final queue = <int>[reference];
+  while (queue.isNotEmpty) {
+    final current = queue.removeAt(0);
+    for (final edge in adjacency[current]) {
+      final other = edge.lower == current ? edge.higher : edge.lower;
+      if (global[other] != null) continue;
+      // hHigherToLower maps higher -> lower; we need other -> current.
+      final hOtherToCurrent = other == edge.higher
+          ? edge.hHigherToLower
+          : _invert3x3(edge.hHigherToLower);
+      global[other] = _mul(global[current]!, hOtherToCurrent);
+      goodMatches += edge.good;
+      inlierCount += edge.inliers;
+      queue.add(other);
     }
   }
 
   // Canvas bounds from the warped image corners.
   var minX = double.infinity, minY = double.infinity;
   var maxX = -double.infinity, maxY = -double.infinity;
-  for (var i = 0; i < n; i++) {
+  for (final i in placed) {
     final w = frames[i].image.cols.toDouble(), h = frames[i].image.rows;
     for (final c in [
       [0.0, 0.0],
@@ -277,7 +286,7 @@ PanoramaStitchResult _stitchFrames(
   final canvasWidth = (maxX - minX).ceil(), canvasHeight = (maxY - minY).ceil();
   if (!minX.isFinite ||
       !minY.isFinite ||
-      canvasWidth < frames.first.image.cols ||
+      canvasWidth < frames[reference].image.cols ||
       canvasWidth > 16000 ||
       canvasHeight < 1 ||
       canvasHeight > 4000) {
@@ -290,12 +299,12 @@ PanoramaStitchResult _stitchFrames(
 
   // Winner-takes-one compositing: at each pixel, keep the single source image
   // whose distance transform (distance to its own border) is largest there,
-  // rather than averaging every overlapping image together. With exhaustive
-  // pairwise matching, images can end up genuinely near-duplicating each
-  // other's coverage (e.g. two images 173° apart by compass that turn out to
-  // share 80%+ real overlap); averaging every contributor there produces a
-  // transparent double-exposure ghost instead of a clean wall, so the seam is
-  // resolved by ownership per pixel instead of blending across it.
+  // rather than averaging every overlapping image together. Two images that
+  // validly overlap can still end up covering nearly the same area (e.g. if
+  // the true angular gap between them turns out much smaller than their
+  // position in the sequence suggested); averaging every contributor there
+  // produces a transparent double-exposure ghost instead of a clean wall, so
+  // the seam is resolved by ownership per pixel instead of blending across it.
   var bestWeight = cv.Mat.zeros(canvasHeight, canvasWidth, cv.MatType.CV_32FC1);
   var bestColor = cv.Mat.zeros(canvasHeight, canvasWidth, cv.MatType.CV_8UC3);
   // Tracks which image currently owns each pixel (255 = none yet), so stray
@@ -307,7 +316,7 @@ PanoramaStitchResult _stitchFrames(
   // it raw, so the mask is eroded first to keep that fringe out of
   // contention entirely.
   final erosionKernel = cv.Mat.ones(11, 11, cv.MatType.CV_8UC1);
-  for (var i = 0; i < n; i++) {
+  for (final i in placed) {
     final m = cv.Mat.fromList(3, 3, cv.MatType.CV_64FC1, _mul(shift, global[i]!));
     final warped = cv.warpPerspective(frames[i].image, m, (canvasWidth, canvasHeight));
     final warpedMaskRaw = cv.warpPerspective(
@@ -338,11 +347,10 @@ PanoramaStitchResult _stitchFrames(
   }
   erosionKernel.dispose();
 
-  // Two images with no validated link to each other can still end up
-  // spatially overlapping on the canvas - each is anchored through its own
-  // independent chain (real evidence or compass), and nothing stops those
-  // chains from crossing in 2D even though the images show unrelated parts
-  // of the space. Where that happens, winner-takes-one can let a small,
+  // Two images can be placed via completely different paths through the
+  // evidence graph and still end up spatially overlapping on the canvas even
+  // though they show unrelated parts of the space - nothing about a 2D
+  // layout stops that. Where it happens, winner-takes-one can let a small,
   // spatially isolated sliver of the "wrong" image through wherever it's
   // locally closer to its own border. Keeping only each image's single
   // largest connected placement removes that; the pixels it drops become
@@ -357,7 +365,7 @@ PanoramaStitchResult _stitchFrames(
   // instead of shipping the scalloped/black-cornered raw canvas.
   final coverage = _coverageMask(bestWeight, canvasWidth, canvasHeight);
   final crop = _largestCoveredRect(coverage, canvasWidth, canvasHeight);
-  if (crop.width < frames.first.image.cols ~/ 2 || crop.height < 10) {
+  if (crop.width < frames[reference].image.cols ~/ 2 || crop.height < 10) {
     for (final mat in [bestWeight, bestColor]) {
       mat.dispose();
     }
@@ -407,7 +415,8 @@ PanoramaStitchResult _stitchFrames(
     totalMatches: totalMatches,
     goodMatches: goodMatches,
     inlierCount: inlierCount,
-    sensorFallbackPairs: sensorFallbackPairs,
+    usedImageCount: placed.length,
+    droppedImages: dropped,
   );
 }
 
@@ -477,33 +486,8 @@ _PairAttempt _matchAndValidate(_Frame cur, _Frame prev, cv.BFMatcher matcher) {
   }
 }
 
-/// A pure horizontal shift in cylindrical space: a heading difference is
-/// exactly a yaw rotation, and the cylindrical projection already linearises
-/// yaw into a horizontal pixel offset scaled by the focal length used for
-/// that projection (see [_prepare]). Sign calibrated against real captured
-/// images: a positive (clockwise) heading increase from [prevHeadingDeg] to
-/// [curHeadingDeg] shifts the current image's content to a smaller
-/// cylindrical x in the previous image's frame.
-List<double> _compassHomography(
-  double f,
-  double prevHeadingDeg,
-  double curHeadingDeg,
-) {
-  final deltaDeg = _angleDiffDeg(curHeadingDeg, prevHeadingDeg);
-  final tx = -f * deltaDeg * math.pi / 180;
-  return <double>[1, 0, tx, 0, 1, 0, 0, 0, 1];
-}
-
-/// Shortest signed difference a-b, wrapped to (-180, 180], in degrees.
-double _angleDiffDeg(double a, double b) {
-  var d = (a - b) % 360;
-  if (d <= -180) d += 360;
-  if (d > 180) d -= 360;
-  return d;
-}
-
 /// Load, downscale, cylindrically project and describe one image.
-_Frame _prepare(String path, int index, cv.SIFT sift, double? headingDeg) {
+_Frame _prepare(String path, int index, cv.SIFT sift) {
   final original = cv.imread(path);
   if (original.isEmpty) {
     throw PanoramaStitchException(
@@ -522,7 +506,9 @@ _Frame _prepare(String path, int index, cv.SIFT sift, double? headingDeg) {
       : original.clone();
   original.dispose();
 
-  // Cylindrical projection so a 360° sweep can be chained with homographies.
+  // Cylindrical projection: a pure rotation of the camera becomes a plain
+  // horizontal pixel shift in this space, which is what lets homographies
+  // between images be chained around a full circle at all.
   final w = small.cols, h = small.rows;
   final f = (w / 2) / math.tan(PanoramaStitcher._assumedHorizontalFov / 2);
   final cx = w / 2, cy = h / 2;
@@ -555,7 +541,7 @@ _Frame _prepare(String path, int index, cv.SIFT sift, double? headingDeg) {
       pair: index,
     );
   }
-  return _Frame(cyl, mask, keypoints, descriptors, f, headingDeg);
+  return _Frame(cyl, mask, keypoints, descriptors);
 }
 
 const _identity = <double>[1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -574,7 +560,7 @@ List<double> _mul(List<double> a, List<double> b) => [
 ];
 
 /// Inverse of a 3x3 matrix via the adjugate, needed to walk a validated edge
-/// backwards (higher-to-lower is what matching produces; the spanning-forest
+/// backwards (higher-to-lower is what matching produces; the spanning-tree
 /// walk sometimes needs lower-to-higher).
 List<double> _invert3x3(List<double> m) {
   final a = m[0], b = m[1], c = m[2];
@@ -617,8 +603,8 @@ String? _degenerate(List<double> h) {
 /// finds its largest 4-connected blob of pixels and zeroes [weight] (a flat
 /// view over the blend accumulator, mutated in place) everywhere that same
 /// image owns a *different*, smaller blob - a spatially isolated fragment
-/// from two independently-anchored, topologically-unrelated placements
-/// happening to overlap on the canvas.
+/// from two independently-placed, topologically-unrelated images happening
+/// to overlap on the canvas.
 void _keepOnlyLargestBlobPerOwner(
   Uint8List owner,
   Float32List weight,
