@@ -298,6 +298,9 @@ PanoramaStitchResult _stitchFrames(
   // resolved by ownership per pixel instead of blending across it.
   var bestWeight = cv.Mat.zeros(canvasHeight, canvasWidth, cv.MatType.CV_32FC1);
   var bestColor = cv.Mat.zeros(canvasHeight, canvasWidth, cv.MatType.CV_8UC3);
+  // Tracks which image currently owns each pixel (255 = none yet), so stray
+  // fragments from an unrelated placement can be found and removed below.
+  var ownerIndex = cv.Mat.fromScalar(canvasHeight, canvasWidth, cv.MatType.CV_8UC1, cv.Scalar.all(255));
   // warpPerspective's bilinear sampling blends real content with the black
   // implicit border right at each image's edge; feather blending used to
   // dilute that into other contributors, but winner-takes-one would display
@@ -324,14 +327,31 @@ PanoramaStitchResult _stitchFrames(
         ? dist
         : dist.convertTo(cv.MatType.CV_32FC1);
     final better = cv.compare(dist32, bestWeight, cv.CMP_GT);
+    final idxMat = cv.Mat.fromScalar(canvasHeight, canvasWidth, cv.MatType.CV_8UC1, cv.Scalar.all(i.toDouble()));
     warped.copyTo(bestColor, mask: better);
     dist32.copyTo(bestWeight, mask: better);
-    for (final mat in [m, warped, warpedMaskRaw, warpedMask, dist, labels, better]) {
+    idxMat.copyTo(ownerIndex, mask: better);
+    for (final mat in [m, warped, warpedMaskRaw, warpedMask, dist, labels, better, idxMat]) {
       mat.dispose();
     }
     if (!identical(dist32, dist)) dist32.dispose();
   }
   erosionKernel.dispose();
+
+  // Two images with no validated link to each other can still end up
+  // spatially overlapping on the canvas - each is anchored through its own
+  // independent chain (real evidence or compass), and nothing stops those
+  // chains from crossing in 2D even though the images show unrelated parts
+  // of the space. Where that happens, winner-takes-one can let a small,
+  // spatially isolated sliver of the "wrong" image through wherever it's
+  // locally closer to its own border. Keeping only each image's single
+  // largest connected placement removes that; the pixels it drops become
+  // uncovered, so the crop below naturally steers around them.
+  final ownerBytes = ownerIndex.data;
+  final weightBytes = bestWeight.data;
+  final weightFloats = weightBytes.buffer.asFloat32List(weightBytes.offsetInBytes, canvasWidth * canvasHeight);
+  _keepOnlyLargestBlobPerOwner(ownerBytes, weightFloats, canvasWidth, canvasHeight);
+  ownerIndex.dispose();
 
   // Crop to the largest rectangle that every source image actually covers,
   // instead of shipping the scalloped/black-cornered raw canvas.
@@ -591,6 +611,68 @@ String? _degenerate(List<double> h) {
   }
   if (h[2].abs() < 1) return 'no horizontal displacement between frames';
   return null;
+}
+
+/// For every image index present in [owner] (0-254; 255 means unowned),
+/// finds its largest 4-connected blob of pixels and zeroes [weight] (a flat
+/// view over the blend accumulator, mutated in place) everywhere that same
+/// image owns a *different*, smaller blob - a spatially isolated fragment
+/// from two independently-anchored, topologically-unrelated placements
+/// happening to overlap on the canvas.
+void _keepOnlyLargestBlobPerOwner(
+  Uint8List owner,
+  Float32List weight,
+  int width,
+  int height,
+) {
+  final total = width * height;
+  final blobId = Int32List(total)..fillRange(0, total, -1);
+  final blobSize = <int>[];
+  final blobOwner = <int>[];
+  for (var start = 0; start < total; start++) {
+    if (blobId[start] != -1 || owner[start] == 255) continue;
+    final ownerVal = owner[start];
+    final id = blobSize.length;
+    blobId[start] = id;
+    final queue = <int>[start];
+    var head = 0;
+    while (head < queue.length) {
+      final idx = queue[head++];
+      final x = idx % width, y = idx ~/ width;
+      if (x > 0 && blobId[idx - 1] == -1 && owner[idx - 1] == ownerVal) {
+        blobId[idx - 1] = id;
+        queue.add(idx - 1);
+      }
+      if (x < width - 1 && blobId[idx + 1] == -1 && owner[idx + 1] == ownerVal) {
+        blobId[idx + 1] = id;
+        queue.add(idx + 1);
+      }
+      if (y > 0 && blobId[idx - width] == -1 && owner[idx - width] == ownerVal) {
+        blobId[idx - width] = id;
+        queue.add(idx - width);
+      }
+      if (y < height - 1 && blobId[idx + width] == -1 && owner[idx + width] == ownerVal) {
+        blobId[idx + width] = id;
+        queue.add(idx + width);
+      }
+    }
+    blobSize.add(queue.length);
+    blobOwner.add(ownerVal);
+  }
+  final largestBlobForOwner = <int, int>{};
+  for (var id = 0; id < blobSize.length; id++) {
+    final o = blobOwner[id];
+    final currentLargest = largestBlobForOwner[o];
+    if (currentLargest == null || blobSize[id] > blobSize[currentLargest]) {
+      largestBlobForOwner[o] = id;
+    }
+  }
+  for (var idx = 0; idx < total; idx++) {
+    final id = blobId[idx];
+    if (id != -1 && id != largestBlobForOwner[blobOwner[id]]) {
+      weight[idx] = 0;
+    }
+  }
 }
 
 /// 0/1 per-pixel coverage (any image contributed a non-zero blend weight),
