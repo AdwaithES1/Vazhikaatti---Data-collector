@@ -34,6 +34,9 @@ class PanoramaStitchResult {
     required this.inlierCount,
     required this.usedImageCount,
     required this.droppedImages,
+    required this.dropReasons,
+    required this.recoveredImages,
+    this.loopClosureErrorDeg,
   });
   final String path;
   final int width;
@@ -44,10 +47,27 @@ class PanoramaStitchResult {
   final int inlierCount;
   /// How many of the input images were actually placed in the panorama.
   final int usedImageCount;
-  /// 1-based indices of images that shared no verified overlap - directly or
-  /// through any other image - with the rest, and so were left out rather
-  /// than forced into the panorama or failing the whole stitch.
+  /// 1-based indices of images that shared no verified overlap - directly,
+  /// indirectly, or under a second detector - with the rest, and so were
+  /// left out rather than forced into the panorama or failing the whole
+  /// stitch.
   final List<int> droppedImages;
+  /// For every entry in [droppedImages], the best evidence found for it and
+  /// why that fell short - e.g. the strongest candidate match's inlier count
+  /// and ratio against the closest other image, and whether an alternate
+  /// detector or indirect (triangulated) recovery was attempted.
+  final Map<int, String> dropReasons;
+  /// 1-based indices of images that did *not* have a direct strong match to
+  /// the main group and were instead placed via a second detector or
+  /// triangulated agreement between two indirect matches.
+  final List<int> recoveredImages;
+  /// If the placed images include a pair whose own matched overlap should
+  /// close the 360° loop (i.e. an edge connecting the two angular extremes of
+  /// the arrangement), the discrepancy in degrees between that edge's own
+  /// implied angle and the angle implied by the rest of the chain - a
+  /// consistency check on the recovered circular structure. Null when no
+  /// such closing edge exists to check against.
+  final double? loopClosureErrorDeg;
   double get inlierRatio => goodMatches == 0 ? 0 : inlierCount / goodMatches;
 }
 
@@ -57,20 +77,23 @@ class PanoramaStitchResult {
 ///
 /// cylindrical pre-warp (so a pure rotation becomes a horizontal pixel shift)
 /// → SIFT → kNN descriptor matching → Lowe ratio test → RANSAC homography,
-/// tried between *every* pair of images, not just some assumed sequence →
-/// the validated pairs form a graph, from which the true circular
-/// arrangement emerges: each image is placed by composing homographies along
-/// the strongest available path back to a reference image within its
-/// connected component → perspective warp → winner-takes-one compositing
-/// (the single most reliable source per pixel, not an average) → crop to the
-/// largest fully-covered rectangle.
+/// tried between *every* pair of images in *both* directions → the validated
+/// pairs form a graph, from which the largest strongly-connected group is
+/// placed by composing homographies along the strongest available path
+/// (maximum-spanning tree by inlier count) → any image left over is put
+/// through a recovery stage: retried against the placed group with a second,
+/// complementary detector (ORB), and - failing that - checked for indirect
+/// (triangulated) agreement between two independently weak matches to two
+/// different placed images, which is accepted as corroborating evidence
+/// without lowering the acceptance bar for any single match → perspective
+/// warp → winner-takes-one compositing (the single most reliable source per
+/// pixel, not an average) → crop to the largest fully-covered rectangle.
 ///
-/// An image that shares no validated overlap with anything else - directly
-/// or transitively - cannot be placed by evidence and is left out of the
-/// panorama rather than guessed at or failing the whole stitch; see
-/// [PanoramaStitchResult.droppedImages]. The pipeline only fails outright
-/// when fewer than 2 images end up connected to each other, or a whole image
-/// can't be decoded or has essentially no texture at all.
+/// An image is only left out when none of the above finds it a trustworthy
+/// place - see [PanoramaStitchResult.droppedImages] and
+/// [PanoramaStitchResult.dropReasons]. The pipeline only fails outright when
+/// fewer than 2 images end up connected to each other at all, or a whole
+/// image can't be decoded or has essentially no texture.
 class PanoramaStitcher {
   static const ratioThreshold = 0.75;
   static const ransacThreshold = 3.0;
@@ -78,6 +101,18 @@ class PanoramaStitcher {
   static const _minGoodMatches = 15;
   static const _minInliers = 12;
   static const _minInlierRatio = 0.3;
+  // Floor for a match to be considered as recovery evidence at all - well
+  // below the acceptance bar above, so a weak candidate is never placed on
+  // its own merit alone; it only counts when a second, independent weak
+  // candidate to a different image corroborates it (see [_tryTriangulation]).
+  static const _weakMinGoodMatches = 6;
+  static const _weakMinInliers = 6;
+  static const _weakMinInlierRatio = 0.15;
+  // Two independent weak candidates must predict the same global angle for
+  // the recovered image within this tolerance to be accepted.
+  static const _triangulationToleranceDeg = 8.0;
+  static const _maxRecoveryPasses = 4;
+  static const _orbFeatures = 2000;
   static const _workingLongSide = 1280;
   // Phone cameras are ~60° wide; used only for the cylindrical pre-warp.
   static const _assumedHorizontalFov = 60 * math.pi / 180;
@@ -92,15 +127,20 @@ class PanoramaStitcher {
 }
 
 class _Frame {
-  _Frame(this.image, this.mask, this.keypoints, this.descriptors);
+  _Frame(this.image, this.mask, this.keypoints, this.descriptors, this.f);
   final cv.Mat image;
   final cv.Mat mask;
   final cv.VecKeyPoint keypoints;
   final cv.Mat descriptors;
+  final double f;
+  // Lazily populated only for images that need recovery.
+  cv.VecKeyPoint? orbKeypoints;
+  cv.Mat? orbDescriptors;
 }
 
 /// Result of matching+RANSAC for one pair, before the caller decides whether
-/// it is trustworthy enough to use.
+/// it is trustworthy enough to use as a strong edge, weak (recovery-only)
+/// evidence, or not at all.
 class _PairAttempt {
   const _PairAttempt({
     required this.totalMatches,
@@ -112,6 +152,16 @@ class _PairAttempt {
   final int good;
   final List<double>? homography;
   final int inliers;
+  bool get isStrong =>
+      homography != null &&
+      good >= PanoramaStitcher._minGoodMatches &&
+      inliers >= PanoramaStitcher._minInliers &&
+      inliers / good >= PanoramaStitcher._minInlierRatio;
+  bool get isWeak =>
+      homography != null &&
+      good >= PanoramaStitcher._weakMinGoodMatches &&
+      inliers >= PanoramaStitcher._weakMinInliers &&
+      inliers / good >= PanoramaStitcher._weakMinInlierRatio;
 }
 
 /// A validated link between two images: [hHigherToLower] maps [higher]'s
@@ -143,6 +193,8 @@ PanoramaStitchResult _stitch(List<String> paths, String outputPath) {
       f.mask.dispose();
       f.keypoints.dispose();
       f.descriptors.dispose();
+      f.orbKeypoints?.dispose();
+      f.orbDescriptors?.dispose();
     }
   }
 }
@@ -164,104 +216,289 @@ PanoramaStitchResult _stitchFrames(
 
   // Try every pair - with no assumed order, "adjacent" means nothing; the
   // true arrangement can only come from checking all of them. Each pair is
-  // checked in both directions (which image is "query" vs "train" for
-  // matching, and "src" vs "dst" for RANSAC), and only kept when *both*
-  // directions independently validate. That choice is not perfectly
-  // symmetric in practice - checking only one, keyed off array index, would
-  // make the result depend on the order the caller happened to pass images
-  // in - but accepting whichever direction happens to pass let through a
-  // one-off asymmetric false positive that blew up the canvas; requiring
-  // agreement from two independent RANSAC fits is both order-independent and
-  // safer than either alone.
-  final edges = <_Edge>[];
+  // checked in both directions and classified by the *weaker* of the two
+  // results, so the outcome never depends on which image happened to be
+  // passed first: a pair only counts as strong evidence when both
+  // directions independently clear the strong bar, and as weak (recovery)
+  // evidence when both clear the much lower weak floor.
+  final strongEdges = <_Edge>[];
+  final weakEdges = <_Edge>[];
   var totalMatches = 0;
   for (var lower = 0; lower < n; lower++) {
     for (var higher = lower + 1; higher < n; higher++) {
-      final forward = _matchAndValidate(frames[higher], frames[lower], matcher);
-      final backward = _matchAndValidate(frames[lower], frames[higher], matcher);
+      final forward = _matchAndValidate(
+        frames[higher].keypoints, frames[higher].descriptors,
+        frames[lower].keypoints, frames[lower].descriptors,
+        matcher,
+      );
+      final backward = _matchAndValidate(
+        frames[lower].keypoints, frames[lower].descriptors,
+        frames[higher].keypoints, frames[higher].descriptors,
+        matcher,
+      );
       totalMatches += forward.totalMatches + backward.totalMatches;
       if (forward.homography == null || backward.homography == null) continue;
-      if (forward.inliers >= backward.inliers) {
-        edges.add(_Edge(lower, higher, forward.homography!, forward.good, forward.inliers));
-      } else {
-        // backward.homography maps lower -> higher; store as higher -> lower.
-        edges.add(_Edge(
-          lower,
-          higher,
-          _invert3x3(backward.homography!),
-          backward.good,
-          backward.inliers,
-        ));
+      // Use whichever direction found more inliers, but only after both have
+      // already independently cleared the same bar.
+      final useForward = forward.inliers >= backward.inliers;
+      final edge = useForward
+          ? _Edge(lower, higher, forward.homography!, forward.good, forward.inliers)
+          : _Edge(lower, higher, _invert3x3(backward.homography!), backward.good, backward.inliers);
+      if (forward.isStrong && backward.isStrong) {
+        strongEdges.add(edge);
+      } else if (forward.isWeak && backward.isWeak) {
+        weakEdges.add(edge);
       }
     }
   }
 
-  // Connected components over every validated edge, regardless of strength,
-  // to find which images share any real evidence with which others at all.
-  final componentOf = List<int>.generate(n, (i) => i);
-  int find(int i) => componentOf[i] == i ? i : componentOf[i] = find(componentOf[i]);
-  for (final edge in edges) {
-    final a = find(edge.lower), b = find(edge.higher);
-    if (a != b) componentOf[a] = b;
+  // Build a maximum-spanning forest (by inlier count) over *every* strong
+  // edge, not just ones touching the eventual largest group - so that if two
+  // images (say A and B) are strongly linked to each other but not to the
+  // main group, and recovery later bridges just A into it, B becomes
+  // reachable through the A-B edge already sitting in this forest, with no
+  // separate recovery needed for B.
+  strongEdges.sort((a, b) => b.inliers.compareTo(a.inliers));
+  final treeOf = List<int>.generate(n, (i) => i);
+  int findTree(int i) => treeOf[i] == i ? i : treeOf[i] = findTree(treeOf[i]);
+  final adjacency = List.generate(n, (_) => <_Edge>[]);
+  final componentSize = <int, int>{for (var i = 0; i < n; i++) i: 1};
+  for (final edge in strongEdges) {
+    final a = findTree(edge.lower), b = findTree(edge.higher);
+    if (a != b) {
+      treeOf[a] = b;
+      componentSize[b] = (componentSize[a] ?? 1) + (componentSize[b] ?? 1);
+      componentSize.remove(a);
+      adjacency[edge.lower].add(edge);
+      adjacency[edge.higher].add(edge);
+    }
   }
-  final membersOf = <int, List<int>>{};
-  for (var i = 0; i < n; i++) {
-    membersOf.putIfAbsent(find(i), () => []).add(i);
-  }
-  final mainRoot = membersOf.entries.reduce((a, b) => a.value.length >= b.value.length ? a : b).key;
-  final placed = membersOf[mainRoot]!..sort();
-  final dropped = [
-    for (var i = 0; i < n; i++)
-      if (find(i) != mainRoot) i + 1,
-  ];
-  if (placed.length < 2) {
+  final mainRoot = componentSize.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+  final core = {for (var i = 0; i < n; i++) if (findTree(i) == mainRoot) i};
+  if (core.length < 2) {
     throw const PanoramaStitchException(
       'matching',
       'no two images share enough verified overlap to build a panorama',
     );
   }
-  final placedSet = placed.toSet();
 
-  // Within the main component, build a maximum-spanning tree (by inlier
-  // count) so each image is placed via its strongest available evidence.
-  final treeEdges = <_Edge>[
-    for (final edge in edges)
-      if (placedSet.contains(edge.lower)) edge,
-  ]..sort((a, b) => b.inliers.compareTo(a.inliers));
-  final treeOf = List<int>.generate(n, (i) => i);
-  int findTree(int i) => treeOf[i] == i ? i : treeOf[i] = findTree(treeOf[i]);
-  final adjacency = List.generate(n, (_) => <_Edge>[]);
-  for (final edge in treeEdges) {
-    final a = findTree(edge.lower), b = findTree(edge.higher);
-    if (a != b) {
-      treeOf[a] = b;
-      adjacency[edge.lower].add(edge);
-      adjacency[edge.higher].add(edge);
+  final global = List<List<double>?>.filled(n, null);
+  var goodMatches = 0, inlierCount = 0;
+  final reference = (core.toList()..sort()).first;
+  final f = frames[reference].f;
+  global[reference] = _identity;
+  void expand(int start) {
+    final queue = <int>[start];
+    while (queue.isNotEmpty) {
+      final current = queue.removeAt(0);
+      for (final edge in adjacency[current]) {
+        final other = edge.lower == current ? edge.higher : edge.lower;
+        if (global[other] != null) continue;
+        final hOtherToCurrent = other == edge.higher
+            ? edge.hHigherToLower
+            : _invert3x3(edge.hHigherToLower);
+        global[other] = _mul(global[current]!, hOtherToCurrent);
+        goodMatches += edge.good;
+        inlierCount += edge.inliers;
+        queue.add(other);
+      }
     }
   }
 
-  // Place every image in the main component by composing homographies along
-  // the tree from a single reference image - the exact arrangement (which
-  // image ends up where, and in what order) falls out of this evidence, not
-  // from the order the images were passed in.
-  final global = List<List<double>?>.filled(n, null);
-  var goodMatches = 0, inlierCount = 0;
-  final reference = placed.first;
-  global[reference] = _identity;
-  final queue = <int>[reference];
-  while (queue.isNotEmpty) {
-    final current = queue.removeAt(0);
-    for (final edge in adjacency[current]) {
-      final other = edge.lower == current ? edge.higher : edge.lower;
-      if (global[other] != null) continue;
-      // hHigherToLower maps higher -> lower; we need other -> current.
-      final hOtherToCurrent = other == edge.higher
-          ? edge.hHigherToLower
-          : _invert3x3(edge.hHigherToLower);
-      global[other] = _mul(global[current]!, hOtherToCurrent);
-      goodMatches += edge.good;
-      inlierCount += edge.inliers;
-      queue.add(other);
+  expand(reference);
+
+  // Recovery: anything not in the core is retried, first with a second
+  // detector against every placed image (same acceptance bar as SIFT, just a
+  // different feature type that may catch texture SIFT missed), then by
+  // checking whether two independently weak matches to two different placed
+  // images agree on where the image belongs - agreement between two
+  // unrelated weak signals is real corroborating evidence, so this recovers
+  // a genuine connection without ever lowering what counts as "connected".
+  // Recovering one image can newly enable triangulation for another, so this
+  // repeats until a full pass makes no further progress.
+  cv.ORB? orb;
+  cv.BFMatcher? orbMatcher;
+  final recovered = <int>[];
+  final bestEvidence = <int, String>{};
+  var pass = 0;
+  var unplaced = [for (var i = 0; i < n; i++) if (global[i] == null) i];
+  while (unplaced.isNotEmpty && pass < PanoramaStitcher._maxRecoveryPasses) {
+    pass++;
+    var progressed = false;
+    for (final d in unplaced) {
+      if (global[d] != null) continue; // placed earlier this pass via triangulation
+      final placedNow = [for (var i = 0; i < n; i++) if (global[i] != null) i];
+
+      // Second detector: same strong bar, different feature type.
+      orb ??= cv.ORB.create(nFeatures: PanoramaStitcher._orbFeatures);
+      orbMatcher ??= cv.BFMatcher.create(type: cv.NORM_HAMMING);
+      _ensureOrb(frames[d], orb);
+      _Edge? orbEdge;
+      for (final c in placedNow) {
+        _ensureOrb(frames[c], orb);
+        final fwd = _matchAndValidate(
+          frames[d].orbKeypoints!, frames[d].orbDescriptors!,
+          frames[c].orbKeypoints!, frames[c].orbDescriptors!,
+          orbMatcher,
+        );
+        final bwd = _matchAndValidate(
+          frames[c].orbKeypoints!, frames[c].orbDescriptors!,
+          frames[d].orbKeypoints!, frames[d].orbDescriptors!,
+          orbMatcher,
+        );
+        if (fwd.isStrong && bwd.isStrong && fwd.homography != null && bwd.homography != null) {
+          final edge = fwd.inliers >= bwd.inliers
+              ? _Edge(math.min(d, c), math.max(d, c),
+                  d < c ? _invert3x3(fwd.homography!) : fwd.homography!, fwd.good, fwd.inliers)
+              : _Edge(math.min(d, c), math.max(d, c),
+                  d < c ? bwd.homography! : _invert3x3(bwd.homography!), bwd.good, bwd.inliers);
+          if (orbEdge == null || edge.inliers > orbEdge.inliers) orbEdge = edge;
+        }
+      }
+      if (orbEdge != null) {
+        final other = orbEdge.lower == d ? orbEdge.higher : orbEdge.lower;
+        final hOtherToD = other == orbEdge.higher ? orbEdge.hHigherToLower : _invert3x3(orbEdge.hHigherToLower);
+        // hOtherToD maps `other` -> d; we need d -> other, i.e. its inverse,
+        // composed onto other's known global position.
+        global[d] = _mul(global[other]!, _invert3x3(hOtherToD));
+        adjacency[d].add(orbEdge);
+        adjacency[other].add(orbEdge);
+        goodMatches += orbEdge.good;
+        inlierCount += orbEdge.inliers;
+        recovered.add(d + 1);
+        progressed = true;
+        expand(d);
+        continue;
+      }
+
+      // Indirect triangulation: gather weak candidates from d to every
+      // currently-placed image - SIFT ones from the already bidirectionally-
+      // validated weakEdges computed up front, plus ORB ones checked the
+      // same bidirectional way here. Requiring both directions to
+      // independently agree, even at this much lower bar, catches pairs
+      // whose apparent match hides a real geometric inconsistency (e.g. the
+      // reverse direction implying an implausible scale change that the
+      // forward direction alone wouldn't reveal).
+      final candidates = <(int other, List<double> hDToOther, int good, int inliers)>[];
+      for (final edge in weakEdges) {
+        if (edge.lower != d && edge.higher != d) continue;
+        final other = edge.lower == d ? edge.higher : edge.lower;
+        if (!placedNow.contains(other)) continue;
+        final hDToOther = edge.higher == d ? edge.hHigherToLower : _invert3x3(edge.hHigherToLower);
+        candidates.add((other, hDToOther, edge.good, edge.inliers));
+      }
+      for (final c in placedNow) {
+        if (frames[d].orbDescriptors == null || frames[c].orbDescriptors == null) continue;
+        final fwd = _matchAndValidate(
+          frames[d].orbKeypoints!, frames[d].orbDescriptors!,
+          frames[c].orbKeypoints!, frames[c].orbDescriptors!,
+          orbMatcher,
+        );
+        final bwd = _matchAndValidate(
+          frames[c].orbKeypoints!, frames[c].orbDescriptors!,
+          frames[d].orbKeypoints!, frames[d].orbDescriptors!,
+          orbMatcher,
+        );
+        if (fwd.isWeak && bwd.isWeak && fwd.homography != null && bwd.homography != null) {
+          final useFwd = fwd.inliers >= bwd.inliers;
+          candidates.add((
+            c,
+            useFwd ? fwd.homography! : _invert3x3(bwd.homography!),
+            useFwd ? fwd.good : bwd.good,
+            useFwd ? fwd.inliers : bwd.inliers,
+          ));
+        }
+      }
+
+      _Edge? accepted;
+      var bestDisagreement = double.infinity;
+      for (var i = 0; i < candidates.length; i++) {
+        for (var j = i + 1; j < candidates.length; j++) {
+          final (c1, hDTo1, good1, inliers1) = candidates[i];
+          final (c2, hDTo2, good2, inliers2) = candidates[j];
+          if (c1 == c2) continue;
+          final angle1 = _effectiveAngleDeg(_mul(global[c1]!, hDTo1), f);
+          final angle2 = _effectiveAngleDeg(_mul(global[c2]!, hDTo2), f);
+          final disagreement = _angleDiffDeg(angle1, angle2).abs();
+          if (disagreement < bestDisagreement) bestDisagreement = disagreement;
+          if (disagreement <= PanoramaStitcher._triangulationToleranceDeg) {
+            final better = inliers1 >= inliers2
+                ? _Edge(math.min(d, c1), math.max(d, c1),
+                    d < c1 ? _invert3x3(hDTo1) : hDTo1, good1, inliers1)
+                : _Edge(math.min(d, c2), math.max(d, c2),
+                    d < c2 ? _invert3x3(hDTo2) : hDTo2, good2, inliers2);
+            if (accepted == null || better.inliers > accepted.inliers) accepted = better;
+          }
+        }
+      }
+      if (accepted != null) {
+        final other = accepted.lower == d ? accepted.higher : accepted.lower;
+        final hOtherToD = other == accepted.higher ? accepted.hHigherToLower : _invert3x3(accepted.hHigherToLower);
+        global[d] = _mul(global[other]!, _invert3x3(hOtherToD));
+        adjacency[d].add(accepted);
+        adjacency[other].add(accepted);
+        goodMatches += accepted.good;
+        inlierCount += accepted.inliers;
+        recovered.add(d + 1);
+        progressed = true;
+        expand(d);
+        continue;
+      }
+
+      // Nothing worked this pass; keep the best evidence seen for reporting.
+      final best = [...candidates]..sort((a, b) => b.$4.compareTo(a.$4));
+      if (best.isNotEmpty) {
+        final (c, _, good, inliers) = best.first;
+        final ratioPct = good == 0 ? 0 : (inliers / good * 100).round();
+        bestEvidence[d + 1] =
+            'best candidate match: $inliers inliers of $good good matches '
+            '($ratioPct% inlier ratio) against image ${c + 1}, short of the '
+            '${PanoramaStitcher._minInliers} inliers / '
+            '${(PanoramaStitcher._minInlierRatio * 100).round()}% ratio required; '
+            'no second independent match agreed closely enough '
+            '(closest disagreement '
+            '${bestDisagreement.isFinite ? '${bestDisagreement.toStringAsFixed(1)}°' : 'n/a'} '
+            'vs the ${PanoramaStitcher._triangulationToleranceDeg.toStringAsFixed(0)}° tolerance) '
+            'to corroborate it';
+      } else {
+        bestEvidence[d + 1] =
+            'no candidate match (even a weak one) was found against any other image, '
+            'with either SIFT or ORB features';
+      }
+    }
+    unplaced = [for (var i = 0; i < n; i++) if (global[i] == null) i];
+    if (!progressed) break;
+  }
+  orb?.dispose();
+  orbMatcher?.dispose();
+
+  final placed = [for (var i = 0; i < n; i++) if (global[i] != null) i]..sort();
+  final dropped = [for (var i = 0; i < n; i++) if (global[i] == null) i + 1];
+  final dropReasons = {for (final d in dropped) d: bestEvidence[d] ?? 'no evidence found'};
+
+  // Loop-closure diagnostic: if the two angular extremes of the placed set
+  // are themselves linked by a candidate edge that wasn't used for
+  // placement, check how well it agrees with the rest of the chain.
+  double? loopClosureErrorDeg;
+  if (placed.length >= 3) {
+    final anglesByImage = {for (final i in placed) i: _effectiveAngleDeg(global[i]!, f)};
+    final sortedByAngle = placed.toList()..sort((a, b) => anglesByImage[a]!.compareTo(anglesByImage[b]!));
+    final lo = sortedByAngle.first, hi = sortedByAngle.last;
+    final closing = [...strongEdges, ...weakEdges].where(
+      (e) => (e.lower == lo && e.higher == hi) || (e.lower == hi && e.higher == lo),
+    ).toList()
+      ..sort((a, b) => b.inliers.compareTo(a.inliers));
+    if (closing.isNotEmpty) {
+      final edge = closing.first;
+      // hHiToLo maps hi's coords -> lo's coords, directly or inverted
+      // depending on which of hi/lo the edge stored as its "higher" index.
+      final hHiToLo = edge.higher == hi ? edge.hHigherToLower : _invert3x3(edge.hHigherToLower);
+      final chainDelta = _angleDiffDeg(anglesByImage[hi]!, anglesByImage[lo]!);
+      final edgeDelta = _angleDiffDeg(
+        _effectiveAngleDeg(_mul(global[lo]!, hHiToLo), f),
+        anglesByImage[lo]!,
+      );
+      loopClosureErrorDeg = _angleDiffDeg(chainDelta, edgeDelta).abs();
     }
   }
 
@@ -417,14 +654,35 @@ PanoramaStitchResult _stitchFrames(
     inlierCount: inlierCount,
     usedImageCount: placed.length,
     droppedImages: dropped,
+    dropReasons: dropReasons,
+    recoveredImages: recovered,
+    loopClosureErrorDeg: loopClosureErrorDeg,
   );
+}
+
+/// Computes ORB keypoints/descriptors for [frame] if not already cached.
+void _ensureOrb(_Frame frame, cv.ORB orb) {
+  if (frame.orbDescriptors != null) return;
+  final gray = cv.cvtColor(frame.image, cv.COLOR_BGR2GRAY);
+  final (kp, desc) = orb.detectAndCompute(gray, frame.mask);
+  gray.dispose();
+  frame.orbKeypoints = kp;
+  frame.orbDescriptors = desc;
 }
 
 /// Runs kNN matching + the Lowe ratio test + RANSAC homography estimation for
 /// one pair, returning a validated homography if one exists - never throws,
-/// so the caller can just skip an unvalidated pair rather than abort.
-_PairAttempt _matchAndValidate(_Frame cur, _Frame prev, cv.BFMatcher matcher) {
-  final knn = matcher.knnMatch(cur.descriptors, prev.descriptors, 2);
+/// so the caller can just skip an unvalidated pair rather than abort. Works
+/// for any detector's keypoints/descriptors (SIFT or ORB), matched with a
+/// distance-appropriate matcher (L2 or Hamming respectively).
+_PairAttempt _matchAndValidate(
+  cv.VecKeyPoint curKp,
+  cv.Mat curDesc,
+  cv.VecKeyPoint prevKp,
+  cv.Mat prevDesc,
+  cv.BFMatcher matcher,
+) {
+  final knn = matcher.knnMatch(curDesc, prevDesc, 2);
   var totalMatches = 0;
   final src = <double>[], dst = <double>[];
   try {
@@ -434,8 +692,8 @@ _PairAttempt _matchAndValidate(_Frame cur, _Frame prev, cv.BFMatcher matcher) {
       totalMatches++;
       if (pairMatches[0].distance <
           PanoramaStitcher.ratioThreshold * pairMatches[1].distance) {
-        final a = cur.keypoints[pairMatches[0].queryIdx];
-        final b = prev.keypoints[pairMatches[0].trainIdx];
+        final a = curKp[pairMatches[0].queryIdx];
+        final b = prevKp[pairMatches[0].trainIdx];
         src..add(a.x)..add(a.y);
         dst..add(b.x)..add(b.y);
       }
@@ -444,7 +702,7 @@ _PairAttempt _matchAndValidate(_Frame cur, _Frame prev, cv.BFMatcher matcher) {
     knn.dispose();
   }
   final good = src.length ~/ 2;
-  if (good < PanoramaStitcher._minGoodMatches) {
+  if (good < PanoramaStitcher._weakMinGoodMatches) {
     return _PairAttempt(totalMatches: totalMatches, good: good);
   }
 
@@ -465,9 +723,7 @@ _PairAttempt _matchAndValidate(_Frame cur, _Frame prev, cv.BFMatcher matcher) {
       }
       final inliers = inlierMask.countNoneZero;
       final hv = _read3x3(h);
-      if (inliers < PanoramaStitcher._minInliers ||
-          inliers / good < PanoramaStitcher._minInlierRatio ||
-          _degenerate(hv) != null) {
+      if (_degenerate(hv) != null) {
         return _PairAttempt(totalMatches: totalMatches, good: good, inliers: inliers);
       }
       return _PairAttempt(
@@ -541,7 +797,7 @@ _Frame _prepare(String path, int index, cv.SIFT sift) {
       pair: index,
     );
   }
-  return _Frame(cyl, mask, keypoints, descriptors);
+  return _Frame(cyl, mask, keypoints, descriptors, f);
 }
 
 const _identity = <double>[1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -584,6 +840,21 @@ List<double> _invert3x3(List<double> m) {
 List<double> _apply(List<double> h, double x, double y) {
   final d = h[6] * x + h[7] * y + h[8];
   return [(h[0] * x + h[1] * y + h[2]) / d, (h[3] * x + h[4] * y + h[5]) / d];
+}
+
+/// The effective horizontal-shift angle (degrees) a global placement matrix
+/// represents, normalising by its own homogeneous scale first since matrix
+/// composition/inversion does not keep that entry at 1. Used only for the
+/// triangulation and loop-closure consistency checks, not for the warp
+/// itself, which uses the full matrix.
+double _effectiveAngleDeg(List<double> g, double f) => -(g[2] / g[8]) / f * 180 / math.pi;
+
+/// Shortest signed difference a-b, wrapped to (-180, 180], in degrees.
+double _angleDiffDeg(double a, double b) {
+  var d = (a - b) % 360;
+  if (d <= -180) d += 360;
+  if (d > 180) d -= 360;
+  return d;
 }
 
 /// Rejects homographies that are not a plausible small camera rotation between

@@ -596,8 +596,13 @@ class _CapturePageState extends State<CapturePage> {
             'descriptor_dimension': PanoramaStitcher.descriptorDimension,
             'keypoint_count': result.keypointCount,
             'reference_image_id': panoramaFrames.first.id,
-            'matching_method': 'BFMatcher kNN + Lowe ratio, matched between '
-                'every image pair (order-independent)',
+            'matching_method': result.recoveredImages.isEmpty
+                ? 'BFMatcher kNN + Lowe ratio, matched between every image '
+                      'pair (order-independent)'
+                : 'BFMatcher kNN + Lowe ratio, matched between every image '
+                      'pair (order-independent); ${result.recoveredImages.length} '
+                      'image(s) recovered via ORB re-matching or indirect '
+                      '(triangulated) agreement between two other images',
             'ratio_test_threshold': PanoramaStitcher.ratioThreshold,
             'total_matches': result.totalMatches,
             'good_matches': result.goodMatches,
@@ -625,6 +630,7 @@ class _CapturePageState extends State<CapturePage> {
       if (droppedIds.isNotEmpty) {
         await _setPanoramaStatus('excluded_no_overlap', onlyIds: droppedIds);
       }
+      final recoveredCount = result.recoveredImages.length;
       panoramaFrames.clear();
       panoramaId = null;
       unawaited(SyncService().syncPending());
@@ -633,8 +639,19 @@ class _CapturePageState extends State<CapturePage> {
           () => status =
               'Panorama saved: $id.jpg (${result.width}x${result.height}) '
               'from ${result.usedImageCount} of $_panoramaShots images'
+              '${recoveredCount == 0 ? '' : ', $recoveredCount recovered via indirect matching'}'
               '${droppedIds.isEmpty ? '' : ' (${droppedIds.length} shared no overlap and were left out)'}',
         );
+        if (result.dropReasons.isNotEmpty) {
+          await showValidation([
+            for (final entry in result.dropReasons.entries)
+              ValidationItem(
+                'Image ${entry.key} left out of the panorama',
+                false,
+                entry.value,
+              ),
+          ]);
+        }
       }
     } on PanoramaStitchException catch (error) {
       await _setPanoramaStatus('failed');
