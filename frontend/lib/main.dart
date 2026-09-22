@@ -290,7 +290,14 @@ class _HomePageState extends State<HomePage> {
 const panoramaDirection = 'Panorama (8)';
 const _panoramaShots = 8;
 const _panoramaStepDegrees = 45;
-const _panoramaToleranceDegrees = 12;
+// A typical rear camera's usable horizontal field of view is ~60-70deg, so a
+// 45deg step leaves only ~15-25deg of true overlap between neighbouring
+// shots to begin with. Real-world testing against actual phone captures
+// showed +-12deg of drift on top of that (steps up to 57deg) was enough to
+// erase that overlap entirely and make stitching geometrically impossible,
+// no matter how the matching is tuned - so the tolerance is kept tight
+// enough to protect that overlap budget rather than just user convenience.
+const _panoramaToleranceDegrees = 6;
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key, required this.session});
