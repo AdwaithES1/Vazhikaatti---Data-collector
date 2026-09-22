@@ -567,6 +567,9 @@ class _CapturePageState extends State<CapturePage> {
       final result = await PanoramaStitcher.stitch(
         panoramaFrames.map((f) => f.imagePath).toList(),
         output.path,
+        headingsDeg: panoramaFrames
+            .map((f) => f.metadata['heading'] as double?)
+            .toList(),
       );
       final id = const Uuid().v4();
       final saved = (await StorageService().saveImage(
@@ -596,7 +599,12 @@ class _CapturePageState extends State<CapturePage> {
             'descriptor_dimension': PanoramaStitcher.descriptorDimension,
             'keypoint_count': result.keypointCount,
             'reference_image_id': panoramaFrames.first.id,
-            'matching_method': 'BFMatcher kNN + Lowe ratio',
+            'matching_method': result.sensorFallbackPairs == 0
+                ? 'BFMatcher kNN + Lowe ratio'
+                : 'BFMatcher kNN + Lowe ratio '
+                      '(${result.sensorFallbackPairs} of '
+                      '${panoramaFrames.length - 1} links used compass '
+                      'heading fallback)',
             'ratio_test_threshold': PanoramaStitcher.ratioThreshold,
             'total_matches': result.totalMatches,
             'good_matches': result.goodMatches,
@@ -604,7 +612,10 @@ class _CapturePageState extends State<CapturePage> {
             'ransac_threshold': PanoramaStitcher.ransacThreshold,
             'inlier_count': result.inlierCount,
             'inlier_ratio': result.inlierRatio,
-            'homography_valid': true,
+            // false whenever any link relied on the compass fallback rather
+            // than a validated homography, so this stays a reliable signal
+            // that every seam in the panorama was geometrically verified.
+            'homography_valid': result.sensorFallbackPairs == 0,
           },
           createdAt: DateTime.now(),
         ),

@@ -7,6 +7,10 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 /// result. For the single-image stages (`load`, `features`), [pair] is the
 /// 1-based index of the failing image itself. For every other stage it is the
 /// 1-based index of the image pair (image `pair` and `pair + 1`).
+///
+/// A pairwise (`matching`/`ransac`/`homography`) failure is only raised when
+/// the compass-heading fallback also could not be used for that pair (no
+/// heading recorded for one of the two images) - see [PanoramaStitcher.stitch].
 class PanoramaStitchException implements Exception {
   const PanoramaStitchException(this.stage, this.message, {this.pair});
   final String stage;
@@ -32,6 +36,7 @@ class PanoramaStitchResult {
     required this.totalMatches,
     required this.goodMatches,
     required this.inlierCount,
+    required this.sensorFallbackPairs,
   });
   final String path;
   final int width;
@@ -40,6 +45,11 @@ class PanoramaStitchResult {
   final int totalMatches;
   final int goodMatches;
   final int inlierCount;
+  /// Number of adjacent pairs (out of images.length - 1) that could not be
+  /// geometrically validated by SIFT/RANSAC and were instead positioned using
+  /// the compass heading recorded for each image. 0 means every link in the
+  /// panorama was validated by feature matching.
+  final int sensorFallbackPairs;
   double get inlierRatio => goodMatches == 0 ? 0 : inlierCount / goodMatches;
 }
 
@@ -47,6 +57,17 @@ class PanoramaStitchResult {
 /// cylindrical pre-warp → SIFT → kNN descriptor matching → Lowe ratio test →
 /// RANSAC homography per neighbouring pair → chained perspective warp →
 /// distance-weighted (feather) blending.
+///
+/// When a pair's matches don't clear the ratio test, RANSAC can't find a
+/// homography, or the homography it finds is geometrically implausible, the
+/// pair is positioned using the compass heading already recorded for each
+/// image (a pure horizontal shift in the cylindrical projection, since a
+/// heading difference is exactly a yaw rotation) instead of being rejected
+/// outright. This still uses only the existing compass sensor already
+/// collected for every capture; it does not add feature recognition beyond
+/// SIFT/RANSAC. The pipeline only fails outright when a pair has no usable
+/// heading for one of its two images, or a whole image can't be decoded or
+/// has essentially no texture at all.
 class PanoramaStitcher {
   static const ratioThreshold = 0.75;
   static const ransacThreshold = 3.0;
@@ -59,31 +80,66 @@ class PanoramaStitcher {
   static const _assumedHorizontalFov = 60 * math.pi / 180;
 
   /// Stitches [imagePaths] (ordered by capture angle) into one JPEG at
-  /// [outputPath]. Runs in a background isolate; throws
-  /// [PanoramaStitchException] on any failure.
+  /// [outputPath]. [headingsDeg], if given, must be the same length as
+  /// [imagePaths] - the compass heading (degrees) recorded for each image, or
+  /// null for images without one; it is only consulted as a fallback for a
+  /// pair that fails geometric validation. Runs in a background isolate;
+  /// throws [PanoramaStitchException] on any failure.
   static Future<PanoramaStitchResult> stitch(
     List<String> imagePaths,
-    String outputPath,
-  ) => Isolate.run(() => _stitch(imagePaths, outputPath));
+    String outputPath, {
+    List<double?>? headingsDeg,
+  }) => Isolate.run(() => _stitch(imagePaths, outputPath, headingsDeg));
 }
 
 class _Frame {
-  _Frame(this.image, this.mask, this.keypoints, this.descriptors);
+  _Frame(this.image, this.mask, this.keypoints, this.descriptors, this.f, this.headingDeg);
   final cv.Mat image;
   final cv.Mat mask;
   final cv.VecKeyPoint keypoints;
   final cv.Mat descriptors;
+  final double f;
+  final double? headingDeg;
 }
 
-PanoramaStitchResult _stitch(List<String> paths, String outputPath) {
+/// Result of matching+RANSAC for one pair, before the caller decides whether
+/// it is trustworthy enough to use.
+class _PairAttempt {
+  const _PairAttempt({
+    required this.totalMatches,
+    required this.good,
+    this.homography,
+    this.inliers = 0,
+    this.failStage,
+    this.failReason,
+  });
+  final int totalMatches;
+  final int good;
+  final List<double>? homography;
+  final int inliers;
+  final String? failStage;
+  final String? failReason;
+}
+
+PanoramaStitchResult _stitch(
+  List<String> paths,
+  String outputPath,
+  List<double?>? headingsDeg,
+) {
   if (paths.length < 2) {
     throw const PanoramaStitchException('input', 'At least 2 images required');
+  }
+  if (headingsDeg != null && headingsDeg.length != paths.length) {
+    throw const PanoramaStitchException(
+      'input',
+      'headingsDeg must be the same length as imagePaths',
+    );
   }
   final sift = cv.SIFT.create(nfeatures: 4000);
   final matcher = cv.BFMatcher.create(type: cv.NORM_L2);
   final frames = <_Frame>[];
   try {
-    return _stitchFrames(paths, outputPath, sift, matcher, frames);
+    return _stitchFrames(paths, outputPath, headingsDeg, sift, matcher, frames);
   } finally {
     // Runs on every exit path (success or a PanoramaStitchException), so a
     // failed/retried stitch never leaks the native Mats/keypoints/descriptors
@@ -100,13 +156,14 @@ PanoramaStitchResult _stitch(List<String> paths, String outputPath) {
 PanoramaStitchResult _stitchFrames(
   List<String> paths,
   String outputPath,
+  List<double?>? headingsDeg,
   cv.SIFT sift,
   cv.BFMatcher matcher,
   List<_Frame> frames,
 ) {
   var keypointCount = 0;
   for (var i = 0; i < paths.length; i++) {
-    final frame = _prepare(paths[i], i + 1, sift);
+    final frame = _prepare(paths[i], i + 1, sift, headingsDeg?[i]);
     keypointCount += frame.keypoints.length;
     frames.add(frame);
   }
@@ -114,85 +171,33 @@ PanoramaStitchResult _stitchFrames(
   // Homography of each image into the previous image's frame, chained to
   // image 0.
   final global = <List<double>>[_identity];
-  var totalMatches = 0, goodMatches = 0, inlierCount = 0;
+  var totalMatches = 0, goodMatches = 0, inlierCount = 0, sensorFallbackPairs = 0;
   for (var i = 1; i < frames.length; i++) {
     final pair = i; // images i and i+1 (1-based)
-    final knn = matcher.knnMatch(
-      frames[i].descriptors,
-      frames[i - 1].descriptors,
-      2,
-    );
-    final src = <double>[], dst = <double>[];
-    var good = 0;
-    try {
-      for (var m = 0; m < knn.length; m++) {
-        final pairMatches = knn[m];
-        if (pairMatches.length < 2) continue;
-        totalMatches++;
-        if (pairMatches[0].distance <
-            PanoramaStitcher.ratioThreshold * pairMatches[1].distance) {
-          final a = frames[i].keypoints[pairMatches[0].queryIdx];
-          final b = frames[i - 1].keypoints[pairMatches[0].trainIdx];
-          src..add(a.x)..add(a.y);
-          dst..add(b.x)..add(b.y);
-          good++;
-        }
+    final attempt = _matchAndValidate(frames[i], frames[i - 1], matcher);
+    totalMatches += attempt.totalMatches;
+
+    var hv = attempt.homography;
+    if (hv != null) {
+      goodMatches += attempt.good;
+      inlierCount += attempt.inliers;
+    } else {
+      final headingCur = frames[i].headingDeg;
+      final headingPrev = frames[i - 1].headingDeg;
+      if (headingCur == null || headingPrev == null) {
+        // No compass fallback available for this pair: the same failure the
+        // pure-vision pipeline always reported.
+        throw PanoramaStitchException(
+          attempt.failStage!,
+          attempt.failReason!,
+          pair: pair,
+        );
       }
-    } finally {
-      knn.dispose();
+      hv = _compassHomography(frames[i - 1].f, headingPrev, headingCur);
+      sensorFallbackPairs++;
+      goodMatches += attempt.good; // still informational, not a validated link
     }
-    if (good < PanoramaStitcher._minGoodMatches) {
-      throw PanoramaStitchException(
-        'matching',
-        'only $good matches survived the ratio test '
-            '(need ${PanoramaStitcher._minGoodMatches}); not enough overlap',
-        pair: pair,
-      );
-    }
-    final srcMat = cv.Mat.fromList(good, 1, cv.MatType.CV_32FC2, src);
-    final dstMat = cv.Mat.fromList(good, 1, cv.MatType.CV_32FC2, dst);
-    final inlierMask = cv.Mat.empty();
-    try {
-      final h = cv.findHomography(
-        srcMat,
-        dstMat,
-        method: cv.RANSAC,
-        ransacReprojThreshold: PanoramaStitcher.ransacThreshold,
-        mask: inlierMask,
-      );
-      try {
-        if (h.isEmpty) {
-          throw PanoramaStitchException(
-            'ransac',
-            'homography could not be estimated',
-            pair: pair,
-          );
-        }
-        final inliers = inlierMask.countNoneZero;
-        final hv = _read3x3(h);
-        if (inliers < PanoramaStitcher._minInliers ||
-            inliers / good < PanoramaStitcher._minInlierRatio) {
-          throw PanoramaStitchException(
-            'ransac',
-            'only $inliers of $good matches are geometrically consistent',
-            pair: pair,
-          );
-        }
-        final why = _degenerate(hv);
-        if (why != null) {
-          throw PanoramaStitchException('homography', why, pair: pair);
-        }
-        goodMatches += good;
-        inlierCount += inliers;
-        global.add(_mul(global[i - 1], hv));
-      } finally {
-        h.dispose();
-      }
-    } finally {
-      srcMat.dispose();
-      dstMat.dispose();
-      inlierMask.dispose();
-    }
+    global.add(_mul(global[i - 1], hv));
   }
 
   // Canvas bounds from the warped image corners.
@@ -298,11 +303,132 @@ PanoramaStitchResult _stitchFrames(
     totalMatches: totalMatches,
     goodMatches: goodMatches,
     inlierCount: inlierCount,
+    sensorFallbackPairs: sensorFallbackPairs,
   );
 }
 
+/// Runs kNN matching + the Lowe ratio test + RANSAC homography estimation for
+/// one adjacent pair, returning a validated homography, or (via [failReason])
+/// why it isn't trustworthy - never throws, so the caller can decide whether
+/// a compass fallback is available before giving up on the pair.
+_PairAttempt _matchAndValidate(_Frame cur, _Frame prev, cv.BFMatcher matcher) {
+  final knn = matcher.knnMatch(cur.descriptors, prev.descriptors, 2);
+  var totalMatches = 0;
+  final src = <double>[], dst = <double>[];
+  try {
+    for (var m = 0; m < knn.length; m++) {
+      final pairMatches = knn[m];
+      if (pairMatches.length < 2) continue;
+      totalMatches++;
+      if (pairMatches[0].distance <
+          PanoramaStitcher.ratioThreshold * pairMatches[1].distance) {
+        final a = cur.keypoints[pairMatches[0].queryIdx];
+        final b = prev.keypoints[pairMatches[0].trainIdx];
+        src..add(a.x)..add(a.y);
+        dst..add(b.x)..add(b.y);
+      }
+    }
+  } finally {
+    knn.dispose();
+  }
+  final good = src.length ~/ 2;
+  if (good < PanoramaStitcher._minGoodMatches) {
+    return _PairAttempt(
+      totalMatches: totalMatches,
+      good: good,
+      failStage: 'matching',
+      failReason:
+          'only $good matches survived the ratio test '
+          '(need ${PanoramaStitcher._minGoodMatches}); not enough overlap',
+    );
+  }
+
+  final srcMat = cv.Mat.fromList(good, 1, cv.MatType.CV_32FC2, src);
+  final dstMat = cv.Mat.fromList(good, 1, cv.MatType.CV_32FC2, dst);
+  final inlierMask = cv.Mat.empty();
+  try {
+    final h = cv.findHomography(
+      srcMat,
+      dstMat,
+      method: cv.RANSAC,
+      ransacReprojThreshold: PanoramaStitcher.ransacThreshold,
+      mask: inlierMask,
+    );
+    try {
+      if (h.isEmpty) {
+        return _PairAttempt(
+          totalMatches: totalMatches,
+          good: good,
+          failStage: 'ransac',
+          failReason: 'homography could not be estimated',
+        );
+      }
+      final inliers = inlierMask.countNoneZero;
+      final hv = _read3x3(h);
+      if (inliers < PanoramaStitcher._minInliers ||
+          inliers / good < PanoramaStitcher._minInlierRatio) {
+        return _PairAttempt(
+          totalMatches: totalMatches,
+          good: good,
+          inliers: inliers,
+          failStage: 'ransac',
+          failReason:
+              'only $inliers of $good matches are geometrically consistent',
+        );
+      }
+      final why = _degenerate(hv);
+      if (why != null) {
+        return _PairAttempt(
+          totalMatches: totalMatches,
+          good: good,
+          inliers: inliers,
+          failStage: 'homography',
+          failReason: why,
+        );
+      }
+      return _PairAttempt(
+        totalMatches: totalMatches,
+        good: good,
+        inliers: inliers,
+        homography: hv,
+      );
+    } finally {
+      h.dispose();
+    }
+  } finally {
+    srcMat.dispose();
+    dstMat.dispose();
+    inlierMask.dispose();
+  }
+}
+
+/// A pure horizontal shift in cylindrical space: a heading difference is
+/// exactly a yaw rotation, and the cylindrical projection already linearises
+/// yaw into a horizontal pixel offset scaled by the focal length used for
+/// that projection (see [_prepare]). Sign calibrated against real captured
+/// images: a positive (clockwise) heading increase from [prevHeadingDeg] to
+/// [curHeadingDeg] shifts the current image's content to a smaller
+/// cylindrical x in the previous image's frame.
+List<double> _compassHomography(
+  double f,
+  double prevHeadingDeg,
+  double curHeadingDeg,
+) {
+  final deltaDeg = _angleDiffDeg(curHeadingDeg, prevHeadingDeg);
+  final tx = -f * deltaDeg * math.pi / 180;
+  return <double>[1, 0, tx, 0, 1, 0, 0, 0, 1];
+}
+
+/// Shortest signed difference a-b, wrapped to (-180, 180], in degrees.
+double _angleDiffDeg(double a, double b) {
+  var d = (a - b) % 360;
+  if (d <= -180) d += 360;
+  if (d > 180) d -= 360;
+  return d;
+}
+
 /// Load, downscale, cylindrically project and describe one image.
-_Frame _prepare(String path, int index, cv.SIFT sift) {
+_Frame _prepare(String path, int index, cv.SIFT sift, double? headingDeg) {
   final original = cv.imread(path);
   if (original.isEmpty) {
     throw PanoramaStitchException(
@@ -354,7 +480,7 @@ _Frame _prepare(String path, int index, cv.SIFT sift) {
       pair: index,
     );
   }
-  return _Frame(cyl, mask, keypoints, descriptors);
+  return _Frame(cyl, mask, keypoints, descriptors, f, headingDeg);
 }
 
 const _identity = <double>[1, 0, 0, 0, 1, 0, 0, 0, 1];
