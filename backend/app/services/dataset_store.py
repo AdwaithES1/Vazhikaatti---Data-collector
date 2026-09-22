@@ -24,6 +24,18 @@ def register_node(payload: dict[str, Any]) -> dict[str, Any]:
         _nodes[payload['id']] = payload
     return payload
 
+def _storage_filename(image_id: str, filename: str) -> str:
+    """The filename already identifies the capture (e.g. the app's own
+    '{image_id}.jpg' convention) as often as not, in which case prefixing
+    image_id again just produces a redundant '{id}_{id}.jpg'. Only prefix
+    when filename doesn't already start with image_id, to still avoid
+    collisions between different captures that reused the same literal
+    filename.
+    """
+    if filename.startswith(f'{image_id}_') or Path(filename).stem == image_id:
+        return filename
+    return f'{image_id}_{filename}'
+
 def upload_capture(image_id: str | None, filename: str | None, checksum: str | None, metadata: dict[str, Any], image_bytes: bytes) -> dict[str, Any]:
     calculated = hashlib.sha256(image_bytes).hexdigest()
     if checksum and checksum != calculated:
@@ -35,7 +47,7 @@ def upload_capture(image_id: str | None, filename: str | None, checksum: str | N
             return {'success': True, 'image_id': existing['image_id'], 'filename': existing['filename'], 'checksum': checksum, 'duplicate': True, 'relative_path': existing['relative_path']}
         image_id = image_id or checksum[:16]
         filename = filename or f'{image_id}.jpg'
-        relative = Path('images') / f'{image_id}_{filename}'
+        relative = Path('images') / _storage_filename(image_id, filename)
         destination = ROOT / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(image_bytes)
