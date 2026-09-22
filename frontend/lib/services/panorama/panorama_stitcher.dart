@@ -54,7 +54,7 @@ class PanoramaStitcher {
   static const _minGoodMatches = 15;
   static const _minInliers = 12;
   static const _minInlierRatio = 0.3;
-  static const _workingLongSide = 960;
+  static const _workingLongSide = 1280;
   // Phone cameras are ~60° wide; used only for the cylindrical pre-warp.
   static const _assumedHorizontalFov = 60 * math.pi / 180;
 
