@@ -15,3 +15,25 @@ const groundTruthBuildingOptions = <String>[
 const groundTruthFloorOptions = <String>['Basement', 'Ground', '1', '2'];
 
 const defaultGroundTruthCampus = 'IIIT K';
+
+const lightingConditionOptions = <String>[
+  'Unknown',
+  'Daylight',
+  'Artificial',
+  'Mixed',
+  'Low light',
+];
+const crowdLevelOptions = <String>['Unknown', 'None', 'Low', 'Medium', 'High'];
+const occlusionLevelOptions = <String>[
+  'Unknown',
+  'None',
+  'Low',
+  'Medium',
+  'High',
+];
+const sceneConditionOptions = <String>[
+  'Unknown',
+  'Clear',
+  'Partially obstructed',
+  'Obstructed',
+];

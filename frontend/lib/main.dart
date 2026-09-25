@@ -16,6 +16,7 @@ import 'services/api/api_client.dart';
 import 'services/api/session_api.dart';
 import 'services/sync/sync_page.dart';
 import 'services/sync/sync_service.dart';
+import 'services/capture/gyro_sweep_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -101,7 +102,7 @@ class _HomePageState extends State<HomePage> {
     if (mounted) {
       await Navigator.push(
         context,
-        MaterialPageRoute(builder: (_) => CapturePage(session: session)),
+        MaterialPageRoute(builder: (_) => CaptureModePage(session: session)),
       );
     }
     await load();
@@ -217,6 +218,37 @@ class _HomePageState extends State<HomePage> {
       leading: const Icon(Icons.folder_outlined),
       title: Text(session.name),
       subtitle: Text(DateFormat.yMMMd().add_jm().format(session.createdAt)),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            icon: const Icon(Icons.camera_alt_outlined),
+            tooltip: 'Single photo capture',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => CapturePage(session: session),
+              ),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.panorama_photosphere_outlined),
+            tooltip: 'Panorama capture',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => CaptureModePage(session: session),
+              ),
+            ),
+          ),
+        ],
+      ),
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CaptureModePage(session: session),
+        ),
+      ),
     ),
   );
   Widget _stat(String value, String label) => Expanded(
@@ -699,29 +731,144 @@ class _CapturePageState extends State<CapturePage> {
   );
 }
 
-class SessionGallery extends StatelessWidget {
-  const SessionGallery({super.key, required this.sessionId});
-  final String sessionId;
+class SessionGallery extends StatefulWidget {
+  const SessionGallery({super.key});
+
+  @override
+  State<SessionGallery> createState() => _SessionGalleryState();
+}
+
+class _SessionGalleryState extends State<SessionGallery> {
+  late Future<List<SessionSummary>> summaries;
+
+  @override
+  void initState() {
+    super.initState();
+    summaries = LocalDatabase.instance.latestSessionSummaries();
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('Session gallery')),
-    body: FutureBuilder<List<CaptureRecord>>(
-      future: LocalDatabase.instance.captures(sessionId),
+    body: FutureBuilder<List<SessionSummary>>(
+      future: summaries,
       builder: (context, snapshot) {
-        final rows = snapshot.data ?? [];
-        if (rows.isEmpty) {
-          return const Center(child: Text('No accepted captures yet.'));
-        }
-        return GridView.builder(
+        final rows = snapshot.data ?? const <SessionSummary>[];
+        if (rows.isEmpty) return const Center(child: Text('No sessions yet.'));
+        return ListView.builder(
           padding: const EdgeInsets.all(12),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            crossAxisSpacing: 8,
-            mainAxisSpacing: 8,
-          ),
           itemCount: rows.length,
-          itemBuilder: (_, index) =>
-              Image.file(File(rows[index].imagePath), fit: BoxFit.cover),
+          itemBuilder: (context, index) {
+            final summary = rows[index];
+            return Card(
+              child: ListTile(
+                leading: summary.thumbnailPath == null
+                    ? const Icon(Icons.folder_outlined, size: 38)
+                    : Image.file(
+                        File(summary.thumbnailPath!),
+                        width: 58,
+                        height: 58,
+                        fit: BoxFit.cover,
+                      ),
+                title: Text(summary.session.name),
+                subtitle: Text(
+                  '${DateFormat.yMMMd().add_jm().format(summary.session.createdAt)}\n'
+                  '${summary.imageCount} images • ${summary.sweepCount} sweeps',
+                ),
+                isThreeLine: true,
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => SessionDetailsPage(summary: summary),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    ),
+  );
+}
+
+class SessionDetailsPage extends StatefulWidget {
+  const SessionDetailsPage({super.key, required this.summary});
+  final SessionSummary summary;
+
+  @override
+  State<SessionDetailsPage> createState() => _SessionDetailsPageState();
+}
+
+class _SessionDetailsPageState extends State<SessionDetailsPage> {
+  bool busy = false;
+  String? message;
+
+  Future<void> _export() async {
+    setState(() => busy = true);
+    try {
+      final file = await StorageService().exportDataset(
+        sessionId: widget.summary.session.id,
+      );
+      await StorageService().shareExport(file);
+      message = 'Session export created and opened in the share sheet.';
+    } catch (error) {
+      message = 'Export failed: $error';
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Session details')),
+    body: FutureBuilder<List<CaptureRecord>>(
+      future: LocalDatabase.instance.captures(widget.summary.session.id),
+      builder: (context, snapshot) {
+        final captures = snapshot.data ?? const <CaptureRecord>[];
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Text(
+              widget.summary.session.name,
+              style: Theme.of(context).textTheme.headlineSmall,
+            ),
+            Text(
+              DateFormat.yMMMd().add_jm().format(
+                widget.summary.session.createdAt,
+              ),
+            ),
+            Text(
+              '${captures.length} images • ${widget.summary.sweepCount} sweeps',
+            ),
+            const SizedBox(height: 16),
+            GridView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                crossAxisSpacing: 6,
+                mainAxisSpacing: 6,
+              ),
+              itemCount: captures.length,
+              itemBuilder: (_, index) => Image.file(
+                File(captures[index].imagePath),
+                fit: BoxFit.cover,
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: busy ? null : _export,
+              icon: busy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(),
+                    )
+                  : const Icon(Icons.folder_zip_outlined),
+              label: const Text('Export Session'),
+            ),
+            if (message != null) Text(message!),
+          ],
         );
       },
     ),
@@ -737,12 +884,40 @@ class ExportPage extends StatefulWidget {
 class _ExportPageState extends State<ExportPage> {
   bool busy = false;
   String? message;
-  Future<void> export() async {
+  List<CaptureSession> sessions = [];
+  Map<String, int> sessionCounts = {};
+  String? selectedSessionId;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSessions();
+  }
+
+  Future<void> _loadSessions() async {
+    final loaded = await LocalDatabase.instance.sessions();
+    final counts = <String, int>{};
+    for (final session in loaded) {
+      counts[session.id] = (await LocalDatabase.instance.captures(
+        session.id,
+      )).length;
+    }
+    if (mounted) {
+      setState(() {
+        sessions = loaded;
+        sessionCounts = counts;
+      });
+    }
+  }
+
+  Future<void> export({String? sessionId}) async {
     setState(() => busy = true);
     try {
-      final file = await StorageService().exportDataset();
+      final file = await StorageService().exportDataset(sessionId: sessionId);
       await StorageService().shareExport(file);
-      message = 'ZIP created locally and opened in the share sheet.';
+      message = sessionId == null
+          ? 'Entire dataset ZIP created and opened in the share sheet.'
+          : 'Single-session ZIP created and opened in the share sheet.';
     } catch (error) {
       message = 'Export failed: $error';
     }
@@ -760,39 +935,73 @@ class _ExportPageState extends State<ExportPage> {
         ).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800),
       ),
       const SizedBox(height: 8),
-      const Text('Everything stays on this phone until you explicitly export.'),
-      const SizedBox(height: 24),
+      const Text('Export the complete dataset or one session only.'),
+      const SizedBox(height: 18),
+      Card(
+        child: ListTile(
+          leading: const Icon(Icons.inventory_2_outlined),
+          title: const Text('Entire Dataset'),
+          subtitle: const Text('All sessions, images, and full metadata'),
+          trailing: FilledButton.icon(
+            onPressed: busy ? null : () => export(),
+            icon: const Icon(Icons.ios_share),
+            label: const Text('Export'),
+          ),
+        ),
+      ),
+      const SizedBox(height: 12),
       Card(
         child: Padding(
-          padding: const EdgeInsets.all(18),
+          padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(
-                Icons.inventory_2_outlined,
-                size: 34,
-                color: Color(0xff0b6e69),
-              ),
-              const SizedBox(height: 12),
               const Text(
-                'ZIP contents',
+                'Single Session',
                 style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
               ),
               const SizedBox(height: 8),
-              const Text(
-                'images/ • metadata.csv • metadata.json\nsessions.json • nodes.json • README.txt',
-              ),
-              const SizedBox(height: 18),
               FilledButton.icon(
-                onPressed: busy ? null : export,
-                icon: busy
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(),
+                onPressed: busy
+                    ? null
+                    : () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const SessionGallery(),
+                        ),
+                      ),
+                icon: const Icon(Icons.photo_library_outlined),
+                label: const Text('Select Session to Export'),
+              ),
+              const SizedBox(height: 8),
+              if (sessions.isEmpty)
+                const Text('No sessions available.')
+              else
+                DropdownButtonFormField<String>(
+                  initialValue: selectedSessionId,
+                  decoration: const InputDecoration(
+                    labelText: 'Choose session',
+                  ),
+                  items: sessions
+                      .map(
+                        (session) => DropdownMenuItem(
+                          value: session.id,
+                          child: Text(
+                            '${session.name} • ${DateFormat.yMMMd().add_jm().format(session.createdAt)} • ${sessionCounts[session.id] ?? 0} captures',
+                          ),
+                        ),
                       )
-                    : const Icon(Icons.ios_share),
-                label: const Text('Create and share ZIP'),
+                      .toList(),
+                  onChanged: busy
+                      ? null
+                      : (value) => setState(() => selectedSessionId = value),
+                ),
+              FilledButton.icon(
+                onPressed: busy || selectedSessionId == null
+                    ? null
+                    : () => export(sessionId: selectedSessionId),
+                icon: const Icon(Icons.folder_zip_outlined),
+                label: const Text('Export Selected Session'),
               ),
             ],
           ),

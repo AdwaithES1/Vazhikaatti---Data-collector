@@ -16,17 +16,39 @@ class CaptureSession {
   Map<String, dynamic> toMap() => {
     'id': id,
     'name': name,
+    'session_name': name,
     'created_at': createdAt.toIso8601String(),
     'collector_id': collectorId,
     'status': status,
   };
   factory CaptureSession.fromMap(Map<String, dynamic> map) => CaptureSession(
     id: map['id'] as String,
-    name: map['name'] as String,
+    name: map['session_name'] as String? ?? map['name'] as String,
     createdAt: DateTime.parse(map['created_at'] as String),
     collectorId: map['collector_id'] as String? ?? 'local-collector',
     status: map['status'] as String? ?? 'active',
   );
+}
+
+class SessionSummary {
+  const SessionSummary({
+    required this.session,
+    required this.imageCount,
+    required this.sweepCount,
+    this.thumbnailPath,
+  });
+
+  final CaptureSession session;
+  final int imageCount;
+  final int sweepCount;
+  final String? thumbnailPath;
+
+  static List<SessionSummary> latestTen(Iterable<SessionSummary> values) =>
+      (values.toList()..sort(
+            (a, b) => b.session.createdAt.compareTo(a.session.createdAt),
+          ))
+          .take(10)
+          .toList();
 }
 
 class CaptureRecord {
@@ -90,6 +112,17 @@ class CaptureRecord {
     'last_sync_error': lastSyncError,
     'server_image_id': serverImageId,
     'uploaded_at': uploadedAt?.toIso8601String(),
+    'session_name': metadata['session_name'],
+    'sweep_id': metadata['sweep_id'],
+    'sweep_index': metadata['sweep_index'],
+    'heading_at_capture': metadata['heading_at_capture'],
+    'sweep_trigger_interval_degrees':
+        metadata['sweep_trigger_interval_degrees'],
+    'sweep_direction': metadata['sweep_direction'],
+    'sweep_total_rotation_degrees': metadata['sweep_total_rotation_degrees'],
+    'ground_truth_local_x': metadata['ground_truth_local_x'],
+    'ground_truth_local_y': metadata['ground_truth_local_y'],
+    'ground_truth_local_z': metadata['ground_truth_local_z'],
   };
   factory CaptureRecord.fromMap(Map<String, dynamic> map) => CaptureRecord(
     id: map['id'] as String,

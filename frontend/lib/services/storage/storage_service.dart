@@ -31,10 +31,32 @@ class StorageService {
     return '${destination.path}|$checksum';
   }
 
-  Future<File> exportDataset() async {
+  Future<File> exportDataset({String? sessionId}) async {
     final base = await root();
-    final captures = await LocalDatabase.instance.captures();
-    final sessions = await LocalDatabase.instance.sessions();
+    final captures = await LocalDatabase.instance.captures(sessionId);
+    captures.sort((a, b) {
+      final aPano = a.metadata['panorama_id'];
+      final bPano = b.metadata['panorama_id'];
+      if (aPano != null && aPano == bPano) {
+        final aFrame = a.metadata['frame_index'];
+        final bFrame = b.metadata['frame_index'];
+        if (aFrame is num && bFrame is num) {
+          return aFrame.compareTo(bFrame);
+        }
+      }
+      return a.createdAt.compareTo(b.createdAt);
+    });
+    final sessions = sessionId == null
+        ? await LocalDatabase.instance.sessions()
+        : (await LocalDatabase.instance.sessions())
+              .where((session) => session.id == sessionId)
+              .toList();
+    if (sessionId != null && sessions.isEmpty) {
+      throw StateError('Session not found');
+    }
+    final sessionPrefix = sessionId == null
+        ? ''
+        : '${_exportName(sessions.single.name)}/';
     final archive = Archive();
     final metadata = captures
         .map(
@@ -48,14 +70,14 @@ class StorageService {
         .toList();
     archive.addFile(
       ArchiveFile(
-        'metadata.json',
+        '${sessionPrefix}metadata.json',
         utf8.encode(jsonEncode(metadata)).length,
         utf8.encode(jsonEncode(metadata)),
       ),
     );
     archive.addFile(
       ArchiveFile(
-        'sessions.json',
+        sessionId == null ? 'sessions.json' : '${sessionPrefix}session.json',
         utf8.encode(jsonEncode(sessions.map((s) => s.toMap()).toList())).length,
         utf8.encode(jsonEncode(sessions.map((s) => s.toMap()).toList())),
       ),
@@ -68,30 +90,40 @@ class StorageService {
     ];
     final csv = const ListToCsvConverter().convert(rows);
     archive.addFile(
-      ArchiveFile('metadata.csv', utf8.encode(csv).length, utf8.encode(csv)),
-    );
-    archive.addFile(
       ArchiveFile(
-        'nodes.json',
-        utf8.encode(jsonEncode(sampleNodes)).length,
-        utf8.encode(jsonEncode(sampleNodes)),
+        '${sessionPrefix}metadata.csv',
+        utf8.encode(csv).length,
+        utf8.encode(csv),
       ),
     );
-    archive.addFile(
-      ArchiveFile(
-        'README.txt',
-        206,
-        utf8.encode(
-          'Vazhikatti Dataset Export\nGenerated fully offline. GPS is rough positioning only; floor and node are explicit ground truth.\n',
+    if (sessionId == null) {
+      archive.addFile(
+        ArchiveFile(
+          'nodes.json',
+          utf8.encode(jsonEncode(sampleNodes)).length,
+          utf8.encode(jsonEncode(sampleNodes)),
         ),
-      ),
-    );
+      );
+      archive.addFile(
+        ArchiveFile(
+          'README.txt',
+          206,
+          utf8.encode(
+            'Vazhikatti Dataset Export\nGenerated fully offline. GPS is rough positioning only; floor and node are explicit ground truth.\n',
+          ),
+        ),
+      );
+    }
     for (final capture in captures) {
       final file = File(capture.imagePath);
       if (await file.exists()) {
         final bytes = await file.readAsBytes();
         archive.addFile(
-          ArchiveFile('images/${capture.filename}', bytes.length, bytes),
+          ArchiveFile(
+            '${sessionPrefix}images/${capture.filename}',
+            bytes.length,
+            bytes,
+          ),
         );
       }
     }
@@ -100,15 +132,20 @@ class StorageService {
     final out = File(
       p.join(
         exportDir.path,
-        'vazhikatti_${DateTime.now().millisecondsSinceEpoch}.zip',
+        'vazhikatti_${sessionId == null ? 'dataset' : 'session_$sessionId'}_${DateTime.now().millisecondsSinceEpoch}.zip',
       ),
     );
     final bytes = ZipEncoder().encode(archive);
-    await out.writeAsBytes(bytes!);
+    await out.writeAsBytes(bytes);
     return out;
   }
 
   Future<void> shareExport(File file) => Share.shareXFiles([
     XFile(file.path),
   ], subject: 'Vazhikatti offline dataset');
+
+  String _exportName(String value) => value
+      .trim()
+      .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_')
+      .replaceAll(RegExp(r'^_+|_+$'), '');
 }

@@ -4,10 +4,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class CaptureMetadata(BaseModel):
     model_config = ConfigDict(extra='allow')
+    image_path: str | None = None
     image_id: str | None = None
     filename: str | None = None
     dataset_split: str | None = None
     capture_session_id: str | None = None
+    session_name: str | None = None
     capture_type: str | None = None
     frame_index: int | None = None
     timestamp: datetime | None = None
@@ -71,6 +73,12 @@ class CaptureMetadata(BaseModel):
     overlap_group_id: str | None = None
     is_panorama_source: bool | None = None
     panorama_status: str | None = None
+    sweep_id: str | None = None
+    sweep_index: int | None = None
+    heading_at_capture: float | None = None
+    sweep_trigger_interval_degrees: float | None = None
+    sweep_direction: str | None = None
+    sweep_total_rotation_degrees: float | None = None
     blur_score: float | None = None
     brightness_score: float | None = None
     contrast_score: float | None = None
@@ -102,6 +110,7 @@ class CaptureMetadata(BaseModel):
     ground_truth_node: str | None = None
     ground_truth_local_x: float | None = None
     ground_truth_local_y: float | None = None
+    ground_truth_local_z: float | None = None
     predicted_building: str | None = None
     predicted_floor: str | None = None
     predicted_node: str | None = None

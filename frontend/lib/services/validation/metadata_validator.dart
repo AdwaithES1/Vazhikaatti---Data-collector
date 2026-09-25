@@ -7,6 +7,11 @@ class ValidationItem {
 
 class MetadataValidator {
   static List<ValidationItem> validate(Map<String, dynamic> data) => [
+    ValidationItem(
+      'Session name',
+      (data['session_name'] as String?)?.trim().isNotEmpty == true,
+      'Enter a session name',
+    ),
     ValidationItem('Image', data['image_path'] != null, 'A photo is required'),
     ValidationItem(
       'GPS',
@@ -39,11 +44,6 @@ class MetadataValidator {
       'Select a floor explicitly',
     ),
     ValidationItem(
-      'Node',
-      (data['node_id'] as String?)?.isNotEmpty == true,
-      'Select a navigation node',
-    ),
-    ValidationItem(
       'Capture direction',
       (data['view_direction'] as String?)?.isNotEmpty == true,
       'Choose Front, Right, Back, Left, or Custom',
@@ -73,6 +73,22 @@ class MetadataValidator {
       (data['ground_truth_node_name'] as String?)?.trim().isNotEmpty == true,
       'Type the node/location name',
     ),
+    ..._coordinateValidation(data),
+  ];
+
+  static List<ValidationItem> _coordinateValidation(
+    Map<String, dynamic> data,
+  ) => [
+    for (final field in const [
+      'ground_truth_local_x',
+      'ground_truth_local_y',
+      'ground_truth_local_z',
+    ])
+      ValidationItem(
+        field,
+        data[field] == null || data[field] is num,
+        'Enter a valid number or leave it empty',
+      ),
   ];
 
   static bool isReady(Map<String, dynamic> data) =>

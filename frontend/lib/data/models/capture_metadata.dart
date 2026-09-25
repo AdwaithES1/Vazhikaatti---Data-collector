@@ -9,10 +9,12 @@ class CaptureMetadata {
   final Map<String, dynamic> extras;
 
   static const fields = <String>[
+    'image_path',
     'image_id',
     'filename',
     'dataset_split',
     'capture_session_id',
+    'session_name',
     'capture_type',
     'frame_index',
     'timestamp',
@@ -76,6 +78,12 @@ class CaptureMetadata {
     'overlap_group_id',
     'is_panorama_source',
     'panorama_status',
+    'sweep_id',
+    'sweep_index',
+    'heading_at_capture',
+    'sweep_trigger_interval_degrees',
+    'sweep_direction',
+    'sweep_total_rotation_degrees',
     'blur_score',
     'brightness_score',
     'contrast_score',
@@ -107,6 +115,7 @@ class CaptureMetadata {
     'ground_truth_node',
     'ground_truth_local_x',
     'ground_truth_local_y',
+    'ground_truth_local_z',
     'predicted_building',
     'predicted_floor',
     'predicted_node',
