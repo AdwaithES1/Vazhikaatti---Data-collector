@@ -36,8 +36,11 @@ class PanoramaStitchResult {
     required this.droppedImages,
     required this.dropReasons,
     required this.recoveredImages,
+    required this.recoveredViaGeometricSearch,
+    required this.yawSearchDiagnostics,
     required this.pairDiagnostics,
     this.loopClosureErrorDeg,
+    this.sensorPlacedLinks = const [],
   });
   final String path;
   final int width;
@@ -62,6 +65,23 @@ class PanoramaStitchResult {
   /// corroborated) match to the main group and were instead placed via
   /// triangulated agreement between two indirect matches.
   final List<int> recoveredImages;
+  /// 1-based indices of images that had no usable direct or triangulated
+  /// feature evidence at all, and were instead placed by searching for their
+  /// yaw directly against the panorama already built from the reliably
+  /// placed images - matching photometric/geometric structure (correlation,
+  /// phase correlation, edge structure, block-matching flow consistency)
+  /// rather than a feature correspondence. See [yawSearchDiagnostics] for
+  /// the full candidate search each of these went through.
+  final List<int> recoveredViaGeometricSearch;
+  /// For every image that went through the geometric yaw-search stage
+  /// (whether or not it was ultimately placed - see
+  /// [recoveredViaGeometricSearch] and [droppedImages]), the top scored
+  /// candidate yaws considered: each line reports the candidate angle, its
+  /// overlap with the existing panorama, feature inliers found against the
+  /// nearest anchors, the photometric/phase-correlation/edge/flow-consistency
+  /// scores, the combined score, and which placed images it was scored
+  /// against.
+  final Map<int, List<String>> yawSearchDiagnostics;
   /// One line per accepted link, in placement order: which two images (1-based),
   /// how many inliers/good matches backed it, and whether it was corroborated
   /// by an independent detector/direction (mutual matching) or only reached
@@ -75,6 +95,11 @@ class PanoramaStitchResult {
   /// consistency check on the recovered circular structure. Null when no
   /// such closing edge exists to check against.
   final double? loopClosureErrorDeg;
+  /// In-order stitching only: 1-based link numbers (link `k` joins image `k`
+  /// to image `k + 1`; link `n` is the closing link from the last image back
+  /// to the first) that had no usable visual overlap and were placed from the
+  /// compass heading difference, or the expected step, instead.
+  final List<int> sensorPlacedLinks;
   double get inlierRatio => goodMatches == 0 ? 0 : inlierCount / goodMatches;
 }
 
@@ -97,10 +122,21 @@ class PanoramaStitchResult {
 /// over goes through indirect recovery: if two independently weak matches to
 /// two different placed images agree on where it belongs, that agreement is
 /// accepted as real evidence without ever lowering the bar for a single
-/// match → perspective warp → winner-takes-one compositing (the single most
-/// reliable source per pixel, not an average, since two images can validly
-/// end up covering nearly the same area) → crop to the largest fully-covered
-/// rectangle.
+/// match → anything *still* unplaced (no usable feature evidence at all)
+/// goes through one more, stronger attempt: its cylindrical projection is
+/// searched over every possible yaw against the panorama already built from
+/// the reliably placed images, scored with several independent
+/// photometric/geometric signals (correlation, phase correlation, edge
+/// structure, block-matching flow consistency, plus SIFT/ORB/AKAZE evidence
+/// for that specific position) and accepted only when at least two of those
+/// signals individually clear their own bar and the combined score clears a
+/// higher bar still - the same mutual-corroboration philosophy as the
+/// feature stage, just without requiring the correspondence to have been a
+/// feature match; the two angular extremes of the final arrangement are
+/// then checked the same way for a closing, 360°-loop edge → perspective
+/// warp → winner-takes-one compositing (the single most reliable source per
+/// pixel, not an average, since two images can validly end up covering
+/// nearly the same area) → crop to the largest fully-covered rectangle.
 ///
 /// An image is only left out when none of the above finds it a trustworthy
 /// place - see [PanoramaStitchResult.droppedImages] and
@@ -138,6 +174,79 @@ class PanoramaStitcher {
   // Phone cameras are ~60° wide; used only for the cylindrical pre-warp.
   static const _assumedHorizontalFov = 60 * math.pi / 180;
 
+  // --- Photometric/geometric yaw-search recovery ---
+  // When an image has no usable direct or triangulated feature evidence at
+  // all, its position is instead searched for directly against the
+  // panorama already built from the reliably placed images, scored with
+  // several independent alignment signals at each candidate yaw - not just
+  // SIFT/ORB feature correspondences. An image is only accepted this way
+  // when at least two of those signals individually clear their own bar and
+  // the combined score clears a higher bar still (mirrors the feature
+  // stage's "mutual corroboration" gate above), so this is never just a
+  // lowered feature-match threshold - see [_searchYaw].
+  static const _yawSearchMaxPasses = 3;
+  static const _yawSearchMinOverlapFraction = 0.12;
+  static const _yawSearchCandidatesPerImage = 8;
+  static const _yawSearchMinPeakScore = 0.15;
+  // Combined-score weights; sum to 1. Photometric correlation and edge
+  // structure carry the most weight since they hold up best on the kind of
+  // image that reaches this stage at all (soft/blurred/noisy enough to have
+  // already failed feature matching) - phase correlation and block-matching
+  // flow consistency still contribute, but weighted so that two solidly
+  // corroborating signals (not necessarily all five) can clear the combined
+  // bar below, matching the "two independent signals agree" philosophy the
+  // feature-matching stage already uses.
+  static const _yawWPhotometric = 0.32;
+  static const _yawWEdge = 0.22;
+  static const _yawWPhaseCorr = 0.18;
+  static const _yawWFlow = 0.18;
+  static const _yawWFeature = 0.10;
+  // Per-signal bars for the "at least two signals individually clear their
+  // own bar" corroboration gate.
+  static const _yawSearchPhotometricBar = 0.55;
+  static const _yawSearchEdgeBar = 0.45;
+  static const _yawSearchPhaseCorrBar = 0.15;
+  static const _yawSearchFlowBar = 0.5;
+  // Below the maximum reachable by the two heaviest-weighted signals alone
+  // (photometric+edge, 0.54) but well above what either reaching its own bar
+  // alone would produce (0.275) - so acceptance needs genuinely strong, not
+  // merely bar-level, agreement from at least two signals.
+  static const _yawSearchAcceptCombined = 0.38;
+  // A candidate must land within this many degrees of some already-placed
+  // image to count as plausibly sitting among the known anchors, and not
+  // this close to one to avoid placing it on top of an existing image.
+  static const _yawSearchMaxGapToNeighborDeg = 70.0;
+  static const _yawSearchDuplicateGuardDeg = 5.0;
+
+  // --- In-order stitching ---
+  // A weak visual estimate (one detector/direction only) is accepted for a
+  // link when it lands this close to what the compass/step predicts - the
+  // sensor acting as the second, independent corroborating estimate.
+  static const _sensorAgreementDeg = 15.0;
+  // Even a strong visual match is overruled by the sensor when they disagree
+  // by more than this: indoor compass error is typically well inside it, so
+  // a larger gap means the match locked onto repeated structure.
+  static const _maxSensorDisagreementDeg = 35.0;
+  // Closing-loop error larger than this is reported but not spread over the
+  // links, since correcting by that much would distort good links.
+  static const _maxLoopCorrectionDeg = 45.0;
+
+  /// Stitches [imagePaths] in the order they were taken: each image is joined
+  /// only to the one before it, and, when [closesLoop], the last back to the
+  /// first. No image is ever left out - a link with no usable visual overlap
+  /// is placed from the difference between the two images' [headingsDeg], or
+  /// failing that [stepDeg]. Throws [PanoramaStitchException] only when such
+  /// a link has neither.
+  static Future<PanoramaStitchResult> stitchInOrder(
+    List<String> imagePaths,
+    String outputPath, {
+    List<double?>? headingsDeg,
+    double? stepDeg,
+    bool closesLoop = false,
+  }) => Isolate.run(
+    () => _stitchInOrder(imagePaths, outputPath, headingsDeg, stepDeg, closesLoop),
+  );
+
   /// Stitches [imagePaths] - in any order - into one JPEG at [outputPath].
   /// Runs in a background isolate; throws [PanoramaStitchException] if fewer
   /// than 2 images end up connected, or an individual image can't be used.
@@ -156,6 +265,11 @@ class _Frame {
   final double f;
   cv.VecKeyPoint? orbKeypoints;
   cv.Mat? orbDescriptors;
+  // Computed lazily, only for images that reach the yaw-search recovery
+  // stage - a third, independent detector family on top of SIFT/ORB used
+  // for every pair up front (see [_ensureAkaze]).
+  cv.VecKeyPoint? akazeKeypoints;
+  cv.Mat? akazeDescriptors;
 }
 
 /// Result of matching+RANSAC for one pair, before the caller decides whether
@@ -198,13 +312,28 @@ class _Estimate {
 /// A validated link between two images: [hHigherToLower] maps [higher]'s
 /// cylindrical coordinates into [lower]'s ([higher] > [lower]).
 class _Edge {
-  const _Edge(this.lower, this.higher, this.hHigherToLower, this.good, this.inliers, this.corroborated);
+  const _Edge(
+    this.lower,
+    this.higher,
+    this.hHigherToLower,
+    this.good,
+    this.inliers,
+    this.corroborated, {
+    this.viaYawSearch = false,
+  });
   final int lower;
   final int higher;
   final List<double> hHigherToLower;
   final int good;
   final int inliers;
   final bool corroborated;
+  /// True when this edge came from the photometric/geometric yaw-search
+  /// recovery stage (matchTemplate/phase-correlation/edge/flow-consistency
+  /// signals against the panorama-so-far, or a direct closing check between
+  /// the two angular extremes) rather than any feature correspondence. Such
+  /// an edge's [good]/[inliers] are a synthetic weight derived from its
+  /// combined score, not a literal match/RANSAC-inlier count.
+  final bool viaYawSearch;
 }
 
 PanoramaStitchResult _stitch(List<String> paths, String outputPath) {
@@ -215,21 +344,202 @@ PanoramaStitchResult _stitch(List<String> paths, String outputPath) {
   final siftMatcher = cv.BFMatcher.create(type: cv.NORM_L2);
   final orb = cv.ORB.create(nFeatures: PanoramaStitcher._orbFeatures);
   final orbMatcher = cv.BFMatcher.create(type: cv.NORM_HAMMING);
+  // AKAZE also produces a binary (MLDB) descriptor, so it shares orbMatcher
+  // (NORM_HAMMING) rather than needing its own matcher instance. Only used
+  // by the yaw-search recovery stage, lazily, for images that reach it.
+  final akaze = cv.AKAZE.create();
   final frames = <_Frame>[];
   try {
-    return _stitchFrames(paths, outputPath, sift, siftMatcher, orb, orbMatcher, frames);
+    return _stitchFrames(paths, outputPath, sift, siftMatcher, orb, orbMatcher, akaze, frames);
   } finally {
     // Runs on every exit path (success or a PanoramaStitchException), so a
     // failed/retried stitch never leaks the native Mats/keypoints/descriptors
     // of the frames that were already prepared.
-    for (final f in frames) {
-      f.image.dispose();
-      f.mask.dispose();
-      f.keypoints.dispose();
-      f.descriptors.dispose();
-      f.orbKeypoints?.dispose();
-      f.orbDescriptors?.dispose();
+    _disposeFrames(frames);
+    orb.dispose();
+    orbMatcher.dispose();
+    akaze.dispose();
+  }
+}
+
+void _disposeFrames(List<_Frame> frames) {
+  for (final f in frames) {
+    f.image.dispose();
+    f.mask.dispose();
+    f.keypoints.dispose();
+    f.descriptors.dispose();
+    f.orbKeypoints?.dispose();
+    f.orbDescriptors?.dispose();
+    f.akazeKeypoints?.dispose();
+    f.akazeDescriptors?.dispose();
+  }
+}
+
+PanoramaStitchResult _stitchInOrder(
+  List<String> paths,
+  String outputPath,
+  List<double?>? headingsDeg,
+  double? stepDeg,
+  bool closesLoop,
+) {
+  if (paths.length < 2) {
+    throw const PanoramaStitchException('input', 'At least 2 images required');
+  }
+  final sift = cv.SIFT.create(nfeatures: 4000);
+  final siftMatcher = cv.BFMatcher.create(type: cv.NORM_L2);
+  final orb = cv.ORB.create(nFeatures: PanoramaStitcher._orbFeatures);
+  final orbMatcher = cv.BFMatcher.create(type: cv.NORM_HAMMING);
+  final frames = <_Frame>[];
+  try {
+    var keypointCount = 0;
+    for (var i = 0; i < paths.length; i++) {
+      // A frame with little texture is still kept: its links fall back to
+      // the sensor instead of failing the panorama.
+      final frame = _prepare(paths[i], i + 1, sift, minKeypoints: 0);
+      _ensureOrb(frame, orb);
+      keypointCount += frame.keypoints.length;
+      frames.add(frame);
     }
+    final n = frames.length;
+    final f = frames.first.f;
+    var totalMatches = 0, goodMatches = 0, inlierCount = 0;
+
+    // Angles here are clockwise turns in degrees, the same sense as a compass
+    // heading: turning right puts the next shot's content to the right, so it
+    // lands at a larger x on the canvas.
+    //
+    // The rotation from image [from] to image [to] that the sensors predict.
+    double? expectedDelta(int from, int to) {
+      final a = headingsDeg?[from], b = headingsDeg?[to];
+      if (a != null && b != null) return _angleDiffDeg(b, a);
+      return stepDeg;
+    }
+
+    // Resolves one link, [from] -> [to], to a rotation: the visual match when
+    // it is trustworthy, otherwise the sensor prediction.
+    ({double delta, bool sensor, String basis})? link(int from, int to) {
+      final pair = _estimatePair(frames[from], frames[to], siftMatcher, orbMatcher);
+      totalMatches += pair.totalMatches;
+      final expected = expectedDelta(from, to);
+      final classified = _classifyPair(from, to, pair.estimates);
+      String? rejected;
+      if (classified != null) {
+        final edge = classified.edge;
+        final visual = -_effectiveAngleDeg(edge.hHigherToLower, f);
+        final disagreement = expected == null ? 0.0 : (visual - expected).abs();
+        final accept = classified.strong
+            ? disagreement <= PanoramaStitcher._maxSensorDisagreementDeg
+            : expected != null && disagreement <= PanoramaStitcher._sensorAgreementDeg;
+        if (accept) {
+          goodMatches += edge.good;
+          inlierCount += edge.inliers;
+          final how = classified.strong
+              ? 'mutually corroborated SIFT/ORB match'
+              : 'single visual match corroborated by the sensor';
+          return (
+            delta: visual,
+            sensor: false,
+            basis: '$how, ${edge.inliers} inliers of ${edge.good} good matches',
+          );
+        }
+        rejected = '${classified.strong ? 'strong' : 'weak'} visual match at '
+            '${visual.toStringAsFixed(1)}° disagreed with the expected '
+            '${expected?.toStringAsFixed(1) ?? '?'}°';
+      }
+      if (expected == null) return null;
+      final source = headingsDeg?[from] != null && headingsDeg?[to] != null
+          ? 'compass heading difference'
+          : 'expected ${stepDeg!.toStringAsFixed(0)}° step';
+      return (
+        delta: expected,
+        sensor: true,
+        basis: '$source - ${rejected ?? 'no trustworthy visual overlap'}',
+      );
+    }
+
+    final deltas = <double>[];
+    final sensorLinks = <int>[];
+    final bases = <String>[];
+    for (var i = 0; i + 1 < n; i++) {
+      final resolved = link(i, i + 1);
+      if (resolved == null) {
+        throw PanoramaStitchException(
+          'matching',
+          'no trustworthy visual overlap, and no heading or step to place it by',
+          pair: i + 1,
+        );
+      }
+      deltas.add(resolved.delta);
+      bases.add(resolved.basis);
+      if (resolved.sensor) sensorLinks.add(i + 1);
+    }
+
+    // Closing the loop: the links around a full turn must add up to 360°.
+    // Any discrepancy is spread over the sensor-placed links first, since
+    // they're the least precise; over all links when every one was visual.
+    double? loopClosureErrorDeg;
+    var loopClosed = false;
+    if (closesLoop && n >= 3) {
+      final closing = link(n - 1, 0);
+      if (closing != null) {
+        if (closing.sensor) sensorLinks.add(n);
+        final error = deltas.fold(0.0, (a, b) => a + b) + closing.delta - 360;
+        loopClosureErrorDeg = error.abs();
+        if (error.abs() <= PanoramaStitcher._maxLoopCorrectionDeg) {
+          loopClosed = true;
+          final absorbing = [
+            for (var k = 0; k < deltas.length; k++)
+              if (sensorLinks.contains(k + 1)) k,
+          ];
+          final targets = absorbing.isEmpty ? [for (var k = 0; k < deltas.length; k++) k] : absorbing;
+          // The closing link takes its share too when it is one of them.
+          final shares = targets.length + (closing.sensor || absorbing.isEmpty ? 1 : 0);
+          for (final k in targets) {
+            deltas[k] -= error / shares;
+          }
+        }
+      }
+    }
+
+    final angle = <double>[0];
+    for (final d in deltas) {
+      angle.add(angle.last + d);
+    }
+    final placed = [for (var i = 0; i < n; i++) i];
+    final global = <int, List<double>>{
+      for (final i in placed) i: <double>[1, 0, f * angle[i] * math.pi / 180, 0, 1, 0, 0, 0, 1],
+    };
+    final (:width, :height) = _compositeAndWrite(
+      frames,
+      placed,
+      global,
+      0,
+      outputPath,
+      maxWidth: loopClosed ? (2 * math.pi * f).round() : null,
+    );
+    return PanoramaStitchResult(
+      path: outputPath,
+      width: width,
+      height: height,
+      keypointCount: keypointCount,
+      totalMatches: totalMatches,
+      goodMatches: goodMatches,
+      inlierCount: inlierCount,
+      usedImageCount: n,
+      droppedImages: const [],
+      dropReasons: const {},
+      recoveredImages: const [],
+      recoveredViaGeometricSearch: const [],
+      yawSearchDiagnostics: const {},
+      pairDiagnostics: [
+        for (var i = 1; i < n; i++)
+          'image ${i + 1}: placed at ${angle[i].toStringAsFixed(1)}° after image $i (${bases[i - 1]})',
+      ],
+      loopClosureErrorDeg: loopClosureErrorDeg,
+      sensorPlacedLinks: sensorLinks,
+    );
+  } finally {
+    _disposeFrames(frames);
     orb.dispose();
     orbMatcher.dispose();
   }
@@ -242,6 +552,7 @@ PanoramaStitchResult _stitchFrames(
   cv.BFMatcher siftMatcher,
   cv.ORB orb,
   cv.BFMatcher orbMatcher,
+  cv.AKAZE akaze,
   List<_Frame> frames,
 ) {
   var keypointCount = 0;
@@ -273,31 +584,9 @@ PanoramaStitchResult _stitchFrames(
   var totalMatches = 0;
   for (var lower = 0; lower < n; lower++) {
     for (var higher = lower + 1; higher < n; higher++) {
-      final estimates = <_Estimate>[];
-      void tryDetector(
-        String family,
-        cv.VecKeyPoint higherKp,
-        cv.Mat higherDesc,
-        cv.VecKeyPoint lowerKp,
-        cv.Mat lowerDesc,
-        cv.BFMatcher detectorMatcher,
-      ) {
-        final fwd = _matchAndValidate(higherKp, higherDesc, lowerKp, lowerDesc, detectorMatcher);
-        totalMatches += fwd.totalMatches;
-        if (fwd.homography != null) {
-          estimates.add(_Estimate(family, fwd.homography!, fwd.good, fwd.inliers));
-        }
-        final bwd = _matchAndValidate(lowerKp, lowerDesc, higherKp, higherDesc, detectorMatcher);
-        totalMatches += bwd.totalMatches;
-        if (bwd.homography != null) {
-          estimates.add(_Estimate(family, _invert3x3(bwd.homography!), bwd.good, bwd.inliers));
-        }
-      }
-
-      tryDetector('SIFT', frames[higher].keypoints, frames[higher].descriptors,
-          frames[lower].keypoints, frames[lower].descriptors, siftMatcher);
-      tryDetector('ORB', frames[higher].orbKeypoints!, frames[higher].orbDescriptors!,
-          frames[lower].orbKeypoints!, frames[lower].orbDescriptors!, orbMatcher);
+      final pair = _estimatePair(frames[lower], frames[higher], siftMatcher, orbMatcher);
+      totalMatches += pair.totalMatches;
+      final estimates = pair.estimates;
 
       final classified = _classifyPair(lower, higher, estimates);
       if (classified == null) continue;
@@ -461,9 +750,242 @@ PanoramaStitchResult _stitchFrames(
     if (!progressed) break;
   }
 
+  // Stage 2: photometric/geometric yaw-search recovery. Anything still
+  // unplaced after direct and triangulated feature evidence gets one more,
+  // stronger attempt: search for where its cylindrical projection actually
+  // lines up against the panorama already built from the reliably placed
+  // images, scored with several independent alignment signals (matchTemplate
+  // correlation, phase correlation, edge-structure correlation, a
+  // block-matching flow-consistency check, and SIFT/ORB/AKAZE feature
+  // evidence for that specific position) rather than requiring a pairwise
+  // feature match to have succeeded on its own. An image is only accepted
+  // when at least two of these independent signals individually clear their
+  // own bar and the combined score clears a higher bar still - the same
+  // "mutual corroboration" philosophy as the feature stage above, with
+  // photometric signals standing in for a second detector/direction, so
+  // this never amounts to just lowering the feature-match threshold. Runs in
+  // passes: recovering one image can open up a second, better-supported
+  // anchor for another (e.g. recovering image 3 first gives image 1 two
+  // neighbours to be tested against, not one) - so every still-unplaced
+  // image is tested against the *whole* panorama built so far each pass, not
+  // only its immediate neighbours.
+  final recoveredViaGeometricSearch = <int>[];
+  final yawSearchDiagnostics = <int, List<String>>{};
+  var yawPass = 0;
+  var stillUnplaced = [for (var i = 0; i < n; i++) if (angle[i] == null) i];
+  while (stillUnplaced.isNotEmpty && yawPass < PanoramaStitcher._yawSearchMaxPasses) {
+    yawPass++;
+    final placedForComposite = [for (var i = 0; i < n; i++) if (angle[i] != null) i];
+    if (placedForComposite.length < 2) break;
+    final composite = _compositeForScoring(placedForComposite, angle, frames, f);
+    var progressed = false;
+    for (final d in stillUnplaced) {
+      if (angle[d] != null) continue; // placed earlier this pass
+      final signals =
+          _searchYaw(frames[d], composite.gray, composite.coverage, composite.worldXAtCol0, f);
+      final lines = <String>[];
+      _YawSignal? acceptedSignal;
+      var acceptedCombined = 0.0;
+      var acceptedFeatureInliers = 0;
+      var acceptedSupport = const <int>[];
+
+      for (final s in signals) {
+        // Which existing images this candidate is closest to - tested
+        // against the whole panorama above, then cross-checked here against
+        // its two nearest anchors specifically (item 7/8).
+        final nearest = placedForComposite.toList()
+          ..sort((a, b) =>
+              (angle[a]! - s.angleDeg).abs().compareTo((angle[b]! - s.angleDeg).abs()));
+        final support = nearest.take(2).toList();
+        final minGap = support.isEmpty ? double.infinity : (angle[support.first]! - s.angleDeg).abs();
+        if (support.isNotEmpty && minGap < PanoramaStitcher._yawSearchDuplicateGuardDeg) {
+          lines.add(_yawCandidateLine(s, 0, support, 0, false, 'coincides with an already-placed image'));
+          continue;
+        }
+        if (minGap > PanoramaStitcher._yawSearchMaxGapToNeighborDeg) {
+          lines.add(_yawCandidateLine(s, 0, support, 0, false, 'too far from any placed anchor'));
+          continue;
+        }
+
+        // Feature evidence for this specific position: whatever SIFT/ORB
+        // evidence already exists from the all-pairs pass above (even
+        // below the "weak" edge bar on its own), plus a fresh AKAZE
+        // attempt - a third, independent detector family, run lazily since
+        // most images never reach this stage.
+        var featureInliers = 0;
+        for (final edge in weakEdges) {
+          if (edge.lower != d && edge.higher != d) continue;
+          final other = edge.lower == d ? edge.higher : edge.lower;
+          if (support.contains(other)) featureInliers = math.max(featureInliers, edge.inliers);
+        }
+        if (support.isNotEmpty) {
+          final anchor = support.first;
+          _ensureAkaze(frames[d], akaze);
+          _ensureAkaze(frames[anchor], akaze);
+          final fwd = _matchAndValidate(
+            frames[d].akazeKeypoints!,
+            frames[d].akazeDescriptors!,
+            frames[anchor].akazeKeypoints!,
+            frames[anchor].akazeDescriptors!,
+            orbMatcher,
+          );
+          featureInliers = math.max(featureInliers, fwd.inliers);
+        }
+        final featureScore = (featureInliers / PanoramaStitcher._minInliers).clamp(0.0, 1.0);
+
+        final combined = PanoramaStitcher._yawWPhotometric * s.photometric +
+            PanoramaStitcher._yawWPhaseCorr * s.phaseCorr +
+            PanoramaStitcher._yawWEdge * s.edge +
+            PanoramaStitcher._yawWFlow * s.flow +
+            PanoramaStitcher._yawWFeature * featureScore;
+        final clearedBars = [
+          s.photometric >= PanoramaStitcher._yawSearchPhotometricBar,
+          s.phaseCorr >= PanoramaStitcher._yawSearchPhaseCorrBar,
+          s.edge >= PanoramaStitcher._yawSearchEdgeBar,
+          s.flow >= PanoramaStitcher._yawSearchFlowBar,
+          featureInliers > 0,
+        ].where((v) => v).length;
+        final accept =
+            combined >= PanoramaStitcher._yawSearchAcceptCombined && clearedBars >= 2;
+
+        lines.add(_yawCandidateLine(s, featureInliers, support, combined, accept, null));
+        if (accept && combined > acceptedCombined) {
+          acceptedSignal = s;
+          acceptedCombined = combined;
+          acceptedFeatureInliers = featureInliers;
+          acceptedSupport = support;
+        }
+      }
+      yawSearchDiagnostics[d + 1] = lines;
+
+      if (acceptedSignal != null) {
+        angle[d] = acceptedSignal.angleDeg;
+        final pseudoWeight = math.max(1, (acceptedCombined * 100).round());
+        for (final other in acceptedSupport) {
+          final lower = math.min(d, other), higher = math.max(d, other);
+          final delta = angle[higher]! - angle[lower]!;
+          final edge = _Edge(
+            lower,
+            higher,
+            _pureRotation(delta, f),
+            math.max(pseudoWeight, acceptedFeatureInliers),
+            pseudoWeight,
+            true,
+            viaYawSearch: true,
+          );
+          adjacency[d].add(edge);
+          adjacency[other].add(edge);
+          placedVia.putIfAbsent(d, () => edge);
+        }
+        recoveredViaGeometricSearch.add(d + 1);
+        progressed = true;
+      } else {
+        final summary = lines.isEmpty
+            ? 'no candidate yaw had enough overlap (${(PanoramaStitcher._yawSearchMinOverlapFraction * 100).round()}%+) with the panorama built so far'
+            : 'best combined score ${signals.isEmpty ? 'n/a' : (acceptedCombined == 0 ? "below the ${PanoramaStitcher._yawSearchAcceptCombined} bar" : acceptedCombined.toStringAsFixed(2))} across ${lines.length} candidate yaw(s) considered';
+        final existing = bestEvidence[d + 1];
+        bestEvidence[d + 1] =
+            '${existing == null ? '' : '$existing; '}geometric yaw-search: $summary';
+      }
+    }
+    composite.gray.dispose();
+    composite.coverage.dispose();
+    stillUnplaced = [for (var i = 0; i < n; i++) if (angle[i] == null) i];
+    if (!progressed) break;
+  }
+
   final placed = [for (var i = 0; i < n; i++) if (angle[i] != null) i]..sort();
   final dropped = [for (var i = 0; i < n; i++) if (angle[i] == null) i + 1];
   final dropReasons = {for (final d in dropped) d: bestEvidence[d] ?? 'no evidence found'};
+
+  // Feed the refinement below every remaining strong edge too, not just the
+  // spanning-tree ones used to reach each image - an actual bundle-style
+  // joint refinement using all reliable evidence at once, including
+  // whatever extra loop-closing redundancy the graph happens to contain.
+  final placedSet = placed.toSet();
+  final allTrackedEdges = <_Edge>[...strongEdges, ...weakEdges];
+  for (final edge in strongEdges) {
+    if (!placedSet.contains(edge.lower) || !placedSet.contains(edge.higher)) continue;
+    final alreadyIn = adjacency[edge.lower].any((e) =>
+        (e.lower == edge.lower && e.higher == edge.higher) ||
+        (e.lower == edge.higher && e.higher == edge.lower));
+    if (!alreadyIn) {
+      adjacency[edge.lower].add(edge);
+      adjacency[edge.higher].add(edge);
+    }
+  }
+
+  // Circular-constraint check: if the two current angular extremes aren't
+  // already linked by any accepted edge, test them directly against each
+  // other with the same multi-signal search used for recovery above,
+  // restricted to the angular neighbourhood where a closing edge would have
+  // to sit. A genuine continuous 360° sweep's first and last images should
+  // show some real overlap even when no feature match was strong enough to
+  // find it on its own; the sequence only closes into a loop when this
+  // clears the same bar as any other recovery, never unconditionally (item
+  // 9-11).
+  if (placed.length >= 3) {
+    final sortedByAngle = placed.toList()..sort((a, b) => angle[a]!.compareTo(angle[b]!));
+    final lo = sortedByAngle.first, hi = sortedByAngle.last;
+    final alreadyLinked = adjacency[lo]
+        .any((e) => (e.lower == lo && e.higher == hi) || (e.lower == hi && e.higher == lo));
+    if (!alreadyLinked) {
+      final loGray = cv.cvtColor(frames[lo].image, cv.COLOR_BGR2GRAY);
+      final signals =
+          _searchYaw(frames[hi], loGray, frames[lo].mask, -f * angle[lo]! * math.pi / 180, f);
+      loGray.dispose();
+      _YawSignal? best;
+      var bestCombined = 0.0;
+      var bestFeatureInliers = 0;
+      for (final s in signals) {
+        // Only a candidate near hi's own already-established position
+        // counts - this validates/discovers the wrap-around overlap that
+        // should exist there, it does not search for some unrelated spot.
+        if ((s.angleDeg - angle[hi]!).abs() > PanoramaStitcher._yawSearchMaxGapToNeighborDeg) continue;
+        var featureInliers = 0;
+        for (final edge in weakEdges) {
+          if ((edge.lower == lo && edge.higher == hi) || (edge.lower == hi && edge.higher == lo)) {
+            featureInliers = math.max(featureInliers, edge.inliers);
+          }
+        }
+        final featureScore = (featureInliers / PanoramaStitcher._minInliers).clamp(0.0, 1.0);
+        final combined = PanoramaStitcher._yawWPhotometric * s.photometric +
+            PanoramaStitcher._yawWPhaseCorr * s.phaseCorr +
+            PanoramaStitcher._yawWEdge * s.edge +
+            PanoramaStitcher._yawWFlow * s.flow +
+            PanoramaStitcher._yawWFeature * featureScore;
+        final clearedBars = [
+          s.photometric >= PanoramaStitcher._yawSearchPhotometricBar,
+          s.phaseCorr >= PanoramaStitcher._yawSearchPhaseCorrBar,
+          s.edge >= PanoramaStitcher._yawSearchEdgeBar,
+          s.flow >= PanoramaStitcher._yawSearchFlowBar,
+          featureInliers > 0,
+        ].where((v) => v).length;
+        if (combined >= PanoramaStitcher._yawSearchAcceptCombined &&
+            clearedBars >= 2 &&
+            combined > bestCombined) {
+          best = s;
+          bestCombined = combined;
+          bestFeatureInliers = featureInliers;
+        }
+      }
+      if (best != null) {
+        final delta = best.angleDeg - angle[lo]!;
+        final closingEdge = _Edge(
+          math.min(lo, hi),
+          math.max(lo, hi),
+          lo < hi ? _pureRotation(delta, f) : _pureRotation(-delta, f),
+          math.max(1, bestFeatureInliers),
+          math.max(1, (bestCombined * 100).round()),
+          true,
+          viaYawSearch: true,
+        );
+        adjacency[lo].add(closingEdge);
+        adjacency[hi].add(closingEdge);
+        allTrackedEdges.add(closingEdge);
+      }
+    }
+  }
 
   // Global refinement: every placed image's angle is re-estimated as the
   // inlier-weighted average of what *every* edge touching it predicts (not
@@ -511,9 +1033,11 @@ PanoramaStitchResult _stitchFrames(
         () {
           final edge = placedVia[i]!;
           final via = edge.lower == i ? edge.higher : edge.lower;
-          final basis = edge.corroborated
-              ? 'triangulated agreement (2+ independent matches)'
-              : 'mutually corroborated direct match';
+          final basis = edge.viaYawSearch
+              ? 'photometric/geometric yaw-search (multi-signal correlation against the panorama, not a feature match)'
+              : edge.corroborated
+                  ? 'triangulated agreement (2+ independent matches)'
+                  : 'mutually corroborated direct match';
           return 'image ${i + 1}: placed at ${angle[i]!.toStringAsFixed(1)}° via image '
               '${via + 1} ($basis, ${edge.inliers} inliers of ${edge.good} good matches)';
         }(),
@@ -526,7 +1050,7 @@ PanoramaStitchResult _stitchFrames(
   if (placed.length >= 3) {
     final sortedByAngle = placed.toList()..sort((a, b) => angle[a]!.compareTo(angle[b]!));
     final lo = sortedByAngle.first, hi = sortedByAngle.last;
-    final closing = [...strongEdges, ...weakEdges].where(
+    final closing = allTrackedEdges.where(
       (e) => (e.lower == lo && e.higher == hi) || (e.lower == hi && e.higher == lo),
     ).toList()
       ..sort((a, b) => b.inliers.compareTo(a.inliers));
@@ -540,6 +1064,40 @@ PanoramaStitchResult _stitchFrames(
     }
   }
 
+  final (:width, :height) = _compositeAndWrite(frames, placed, global, reference, outputPath);
+  return PanoramaStitchResult(
+    path: outputPath,
+    width: width,
+    height: height,
+    keypointCount: keypointCount,
+    totalMatches: totalMatches,
+    goodMatches: goodMatches,
+    inlierCount: inlierCount,
+    usedImageCount: placed.length,
+    droppedImages: dropped,
+    dropReasons: dropReasons,
+    recoveredImages: recovered,
+    recoveredViaGeometricSearch: recoveredViaGeometricSearch,
+    yawSearchDiagnostics: yawSearchDiagnostics,
+    pairDiagnostics: pairDiagnostics,
+    loopClosureErrorDeg: loopClosureErrorDeg,
+  );
+}
+
+/// Warps every [placed] frame by its [global] placement onto one canvas,
+/// composites winner-takes-one, crops to the fully covered rectangle, writes
+/// the JPEG to [outputPath] and validates it on disk. Shared by the unordered
+/// and in-order pipelines, which differ only in how they find [global].
+/// [maxWidth] trims a closed 360° loop to exactly one turn, so the content
+/// that wraps past the first frame doesn't appear twice.
+({int width, int height}) _compositeAndWrite(
+  List<_Frame> frames,
+  List<int> placed,
+  Map<int, List<double>> global,
+  int reference,
+  String outputPath, {
+  int? maxWidth,
+}) {
   // Canvas bounds from the warped image corners.
   var minX = double.infinity, minY = double.infinity;
   var maxX = -double.infinity, maxY = -double.infinity;
@@ -651,7 +1209,7 @@ PanoramaStitchResult _stitchFrames(
   }
   final result = cv.Mat.fromMat(
     bestColor,
-    roi: cv.Rect(crop.left, crop.top, crop.width, crop.height),
+    roi: cv.Rect(crop.left, crop.top, math.min(crop.width, maxWidth ?? crop.width), crop.height),
     copy: true,
   );
   final width = result.cols, height = result.rows;
@@ -682,21 +1240,7 @@ PanoramaStitchResult _stitchFrames(
       'stitched file is unreadable, wrong size (${openedW}x$openedH) or mostly empty',
     );
   }
-  return PanoramaStitchResult(
-    path: outputPath,
-    width: width,
-    height: height,
-    keypointCount: keypointCount,
-    totalMatches: totalMatches,
-    goodMatches: goodMatches,
-    inlierCount: inlierCount,
-    usedImageCount: placed.length,
-    droppedImages: dropped,
-    dropReasons: dropReasons,
-    recoveredImages: recovered,
-    pairDiagnostics: pairDiagnostics,
-    loopClosureErrorDeg: loopClosureErrorDeg,
-  );
+  return (width: width, height: height);
 }
 
 /// Computes ORB keypoints/descriptors for [frame] if not already cached.
@@ -707,6 +1251,58 @@ void _ensureOrb(_Frame frame, cv.ORB orb) {
   gray.dispose();
   frame.orbKeypoints = kp;
   frame.orbDescriptors = desc;
+}
+
+/// Computes AKAZE keypoints/descriptors for [frame] if not already cached -
+/// a third, independent detector family used only by the yaw-search recovery
+/// stage, lazily, since the images that never need recovery never pay for it.
+void _ensureAkaze(_Frame frame, cv.AKAZE akaze) {
+  if (frame.akazeDescriptors != null) return;
+  final gray = cv.cvtColor(frame.image, cv.COLOR_BGR2GRAY);
+  final (kp, desc) = akaze.detectAndCompute(gray, frame.mask);
+  gray.dispose();
+  frame.akazeKeypoints = kp;
+  frame.akazeDescriptors = desc;
+}
+
+/// Every validated homography estimate for how [higher] sits relative to
+/// [lower] - SIFT and ORB, each matched in both directions - expressed as
+/// mapping [higher]'s coordinates into [lower]'s. A frame with too few
+/// features for a detector simply contributes no estimate from it.
+({List<_Estimate> estimates, int totalMatches}) _estimatePair(
+  _Frame lower,
+  _Frame higher,
+  cv.BFMatcher siftMatcher,
+  cv.BFMatcher orbMatcher,
+) {
+  final estimates = <_Estimate>[];
+  var totalMatches = 0;
+  void tryDetector(
+    String family,
+    cv.VecKeyPoint higherKp,
+    cv.Mat higherDesc,
+    cv.VecKeyPoint lowerKp,
+    cv.Mat lowerDesc,
+    cv.BFMatcher detectorMatcher,
+  ) {
+    if (higherKp.length < 2 || lowerKp.length < 2) return;
+    final fwd = _matchAndValidate(higherKp, higherDesc, lowerKp, lowerDesc, detectorMatcher);
+    totalMatches += fwd.totalMatches;
+    if (fwd.homography != null) {
+      estimates.add(_Estimate(family, fwd.homography!, fwd.good, fwd.inliers));
+    }
+    final bwd = _matchAndValidate(lowerKp, lowerDesc, higherKp, higherDesc, detectorMatcher);
+    totalMatches += bwd.totalMatches;
+    if (bwd.homography != null) {
+      estimates.add(_Estimate(family, _invert3x3(bwd.homography!), bwd.good, bwd.inliers));
+    }
+  }
+
+  tryDetector('SIFT', higher.keypoints, higher.descriptors, lower.keypoints, lower.descriptors,
+      siftMatcher);
+  tryDetector('ORB', higher.orbKeypoints!, higher.orbDescriptors!, lower.orbKeypoints!,
+      lower.orbDescriptors!, orbMatcher);
+  return (estimates: estimates, totalMatches: totalMatches);
 }
 
 /// Given every valid (geometrically non-degenerate) estimate found for a
@@ -834,7 +1430,7 @@ _PairAttempt _matchAndValidate(
 }
 
 /// Load, downscale, cylindrically project and describe one image.
-_Frame _prepare(String path, int index, cv.SIFT sift) {
+_Frame _prepare(String path, int index, cv.SIFT sift, {int minKeypoints = 50}) {
   final original = cv.imread(path);
   if (original.isEmpty) {
     throw PanoramaStitchException(
@@ -882,7 +1478,7 @@ _Frame _prepare(String path, int index, cv.SIFT sift) {
   final gray = cv.cvtColor(cyl, cv.COLOR_BGR2GRAY);
   final (keypoints, descriptors) = sift.detectAndCompute(gray, mask);
   gray.dispose();
-  if (keypoints.length < 50) {
+  if (keypoints.length < minKeypoints) {
     throw PanoramaStitchException(
       'features',
       'image $index has only ${keypoints.length} SIFT keypoints (too little texture or too blurry)',
@@ -939,6 +1535,15 @@ List<double> _apply(List<double> h, double x, double y) {
 /// itself, which uses the full matrix.
 double _effectiveAngleDeg(List<double> g, double f) => -(g[2] / g[8]) / f * 180 / math.pi;
 
+/// Inverse of [_effectiveAngleDeg]: the pure-horizontal-shift matrix
+/// representing a rotation of [deltaDeg] between two images, in the same
+/// convention [_effectiveAngleDeg] reads back (`angle[higher] = angle[lower]
+/// + delta`). Used to build synthetic edges for the yaw-search recovery
+/// stage, whose evidence is an already-known angle difference rather than a
+/// matched homography.
+List<double> _pureRotation(double deltaDeg, double f) =>
+    <double>[1, 0, -deltaDeg * f * math.pi / 180, 0, 1, 0, 0, 0, 1];
+
 /// Shortest signed difference a-b, wrapped to (-180, 180], in degrees.
 double _angleDiffDeg(double a, double b) {
   var d = (a - b) % 360;
@@ -958,6 +1563,444 @@ String? _degenerate(List<double> h) {
   }
   if (h[2].abs() < 1) return 'no horizontal displacement between frames';
   return null;
+}
+
+/// Builds a lightweight winner-takes-one composite of [subset] at their
+/// current [angle]s, in grayscale, purely for the yaw-search recovery stage
+/// to score unplaced images against - never shipped, so unlike the final
+/// compositing this tracks no owner index and does no blob cleanup or crop.
+/// Same warp/blend approach as the final output, so a candidate is scored
+/// against genuinely the same pixels it would land among if placed.
+/// [worldXAtCol0] is the world x-coordinate (in the same convention as
+/// [_apply]/[global] elsewhere in this file) that column 0 of the returned
+/// [gray] corresponds to. Caller disposes [gray] and [coverage].
+({int width, int height, double worldXAtCol0, cv.Mat gray, cv.Mat coverage})
+_compositeForScoring(
+  List<int> subset,
+  List<double?> angle,
+  List<_Frame> frames,
+  double f,
+) {
+  var minX = double.infinity, minY = double.infinity;
+  var maxX = -double.infinity, maxY = -double.infinity;
+  final global = <int, List<double>>{};
+  for (final i in subset) {
+    final g = <double>[1, 0, -f * angle[i]! * math.pi / 180, 0, 1, 0, 0, 0, 1];
+    global[i] = g;
+    final w = frames[i].image.cols.toDouble(), h = frames[i].image.rows.toDouble();
+    for (final c in [
+      [0.0, 0.0],
+      [w, 0.0],
+      [w, h],
+      [0.0, h],
+    ]) {
+      final p = _apply(g, c[0], c[1]);
+      minX = math.min(minX, p[0]);
+      maxX = math.max(maxX, p[0]);
+      minY = math.min(minY, p[1]);
+      maxY = math.max(maxY, p[1]);
+    }
+  }
+  final width = (maxX - minX).ceil(), height = (maxY - minY).ceil();
+  final shift = <double>[1, 0, -minX, 0, 1, -minY, 0, 0, 1];
+  var bestWeight = cv.Mat.zeros(height, width, cv.MatType.CV_32FC1);
+  var bestGray = cv.Mat.zeros(height, width, cv.MatType.CV_8UC1);
+  final erosionKernel = cv.Mat.ones(11, 11, cv.MatType.CV_8UC1);
+  for (final i in subset) {
+    final m = cv.Mat.fromList(3, 3, cv.MatType.CV_64FC1, _mul(shift, global[i]!));
+    final gray = cv.cvtColor(frames[i].image, cv.COLOR_BGR2GRAY);
+    final warped = cv.warpPerspective(gray, m, (width, height));
+    final warpedMaskRaw = cv.warpPerspective(
+      frames[i].mask,
+      m,
+      (width, height),
+      flags: cv.INTER_NEAREST,
+    );
+    final warpedMask = cv.erode(warpedMaskRaw, erosionKernel);
+    final (dist, labels) = cv.distanceTransform(warpedMask, cv.DIST_L2, 3, cv.DIST_LABEL_CCOMP);
+    final dist32 = dist.type == cv.MatType.CV_32FC1 ? dist : dist.convertTo(cv.MatType.CV_32FC1);
+    final better = cv.compare(dist32, bestWeight, cv.CMP_GT);
+    warped.copyTo(bestGray, mask: better);
+    dist32.copyTo(bestWeight, mask: better);
+    for (final mat in [m, gray, warped, warpedMaskRaw, warpedMask, dist, labels, better]) {
+      mat.dispose();
+    }
+    if (!identical(dist32, dist)) dist32.dispose();
+  }
+  erosionKernel.dispose();
+  return (width: width, height: height, worldXAtCol0: minX, gray: bestGray, coverage: bestWeight);
+}
+
+/// One candidate yaw for an unplaced image, with several independent
+/// alignment signals - see [_searchYaw]. All scores are normalised to
+/// [0, 1], higher is better.
+class _YawSignal {
+  const _YawSignal({
+    required this.angleDeg,
+    required this.overlapFraction,
+    required this.photometric,
+    required this.phaseCorr,
+    required this.edge,
+    required this.flow,
+  });
+  /// Candidate global angle (degrees), refined to sub-pixel precision via
+  /// the phase-correlation residual.
+  final double angleDeg;
+  /// Fraction of the candidate's own pixels that land on already-covered
+  /// panorama content at this yaw.
+  final double overlapFraction;
+  /// Normalised-cross-correlation peak (matchTemplate, TM_CCOEFF_NORMED) -
+  /// the primary photometric/correlation signal.
+  final double photometric;
+  /// cv.phaseCorrelate's response (confidence) for this alignment.
+  final double phaseCorr;
+  /// Normalised cross-correlation between the two images' Canny edge maps -
+  /// the edge/line-structure signal.
+  final double edge;
+  /// Block-matching dense-flow-consistency proxy: how uniform the local
+  /// residual displacement is across the overlap region once the global
+  /// candidate shift is applied - low, consistent residual flow indicates a
+  /// genuine structural alignment rather than a coincidental global
+  /// correlation peak.
+  final double flow;
+}
+
+/// Scans every possible horizontal (yaw) alignment of [template]'s
+/// cylindrical image against [refGray] (either a composite built by
+/// [_compositeForScoring], or a single neighbour's own cylindrical image
+/// used directly for the loop-closing check), returning the top scored
+/// distinct local maxima together with several independent alignment
+/// signals for each - not just a single correlation number, and not just a
+/// feature correspondence. [refCoverage] marks which pixels of [refGray]
+/// hold real content (a float32 weight map, >0 = covered, from
+/// [_compositeForScoring]; or a plain 0/255 mask for the single-neighbour
+/// case). [refWorldXAtCol0] is the world x-coordinate column 0 of [refGray]
+/// corresponds to (see [_compositeForScoring]).
+List<_YawSignal> _searchYaw(
+  _Frame template,
+  cv.Mat refGray,
+  cv.Mat refCoverage,
+  double refWorldXAtCol0,
+  double f,
+) {
+  final templGray = cv.cvtColor(template.image, cv.COLOR_BGR2GRAY);
+  final tw = templGray.cols, th = templGray.rows;
+  if (refGray.rows < th) {
+    templGray.dispose();
+    return const [];
+  }
+
+  // Two adjacent captures typically only overlap over part of their width,
+  // not the whole frame (a 60°-FOV shot 45° from its neighbour shares only
+  // about a quarter of its width). Correlating the *entire* template at once
+  // dilutes a real match with the majority of the frame that has nothing to
+  // do with this particular neighbour, so the search itself runs over
+  // several edge-focused sub-windows of the template - the regions actually
+  // likely to hold the true overlap - as well as the full frame, and merges
+  // whatever each finds. Still an exhaustive search over every possible yaw
+  // (item 3/5), just scored at a scale that matches how these images
+  // actually overlap.
+  final edgeWidth = math.max(60, (tw * 0.35).round());
+  final windows = <(int offset, int width)>{
+    (0, tw),
+    if (edgeWidth < tw) (0, edgeWidth),
+    if (edgeWidth < tw) (tw - edgeWidth, edgeWidth),
+  }.where((w) => w.$2 <= refGray.cols).toList();
+  if (windows.isEmpty) {
+    templGray.dispose();
+    return const [];
+  }
+
+  // Candidate positions are tracked as "where in refGray would this
+  // template's own local x=0 land" - a common coordinate space every
+  // window's peaks convert into, so a left-edge-window peak and a
+  // right-edge-window peak referring to the same true alignment merge into
+  // one candidate instead of being reported twice.
+  final candidateScore = <int, double>{};
+  final candidateY = <int, int>{};
+  // Which window (offset, width) within the template actually produced each
+  // candidate's peak - the genuinely-overlapping sub-region, used below to
+  // scope every other signal to the same area instead of diluting them
+  // against the template's full (mostly non-overlapping) width again.
+  final candidateWindow = <int, (int, int)>{};
+  for (final (offset, width) in windows) {
+    final sub = cv.Mat.fromMat(templGray, roi: cv.Rect(offset, 0, width, th), copy: true);
+    final result = cv.matchTemplate(refGray, sub, cv.TM_CCOEFF_NORMED);
+    sub.dispose();
+    final rw = result.cols, rh = result.rows;
+    final resultBytes = result.data;
+    final resultF = resultBytes.buffer.asFloat32List(resultBytes.offsetInBytes, rw * rh);
+
+    // Collapse to a 1D profile over x (best score at any y) - rotation-only
+    // capture means the true alignment should sit at y≈0 regardless, so
+    // scanning every y just finds it; a large winning y is itself a sign a
+    // candidate isn't a real match.
+    final profile = Float32List(rw);
+    final profileY = Int32List(rw);
+    for (var x = 0; x < rw; x++) {
+      var best = -2.0, bestY = 0;
+      for (var y = 0; y < rh; y++) {
+        final v = resultF[y * rw + x];
+        if (v > best) {
+          best = v;
+          bestY = y;
+        }
+      }
+      profile[x] = best;
+      profileY[x] = bestY;
+    }
+
+    final nmsWindow = math.max(10, width ~/ 3);
+    for (var x = 0; x < rw; x++) {
+      if (profile[x] < PanoramaStitcher._yawSearchMinPeakScore) continue;
+      var isPeak = true;
+      for (var k = math.max(0, x - nmsWindow); k <= math.min(rw - 1, x + nmsWindow); k++) {
+        if (profile[k] > profile[x]) {
+          isPeak = false;
+          break;
+        }
+      }
+      if (!isPeak) continue;
+      final template0 = x - offset;
+      var merged = false;
+      for (final key in candidateScore.keys.toList()) {
+        if ((key - template0).abs() > nmsWindow) continue;
+        merged = true;
+        if (profile[x] > candidateScore[key]!) {
+          candidateScore.remove(key);
+          candidateY.remove(key);
+          candidateWindow.remove(key);
+          candidateScore[template0] = profile[x];
+          candidateY[template0] = profileY[x];
+          candidateWindow[template0] = (offset, width);
+        }
+        break;
+      }
+      if (!merged) {
+        candidateScore[template0] = profile[x];
+        candidateY[template0] = profileY[x];
+        candidateWindow[template0] = (offset, width);
+      }
+    }
+    result.dispose();
+  }
+
+  final ranked = candidateScore.keys.toList()
+    ..sort((a, b) => candidateScore[b]!.compareTo(candidateScore[a]!));
+  final topPeaks = ranked.take(PanoramaStitcher._yawSearchCandidatesPerImage).toList();
+
+  final coverageBytes = refCoverage.data;
+  final coverageIsFloat = refCoverage.type == cv.MatType.CV_32FC1;
+  final coverageF = coverageIsFloat
+      ? coverageBytes.buffer.asFloat32List(coverageBytes.offsetInBytes, refGray.cols * refGray.rows)
+      : null;
+  final coverageU8 = coverageIsFloat
+      ? null
+      : coverageBytes.buffer.asUint8List(coverageBytes.offsetInBytes, refGray.cols * refGray.rows);
+  bool covered(int idx) => coverageIsFloat ? coverageF![idx] > 0 : coverageU8![idx] > 0;
+
+  final out = <_YawSignal>[];
+  for (final xPeak0 in topPeaks) {
+    final yPeak = candidateY[xPeak0]!;
+    final (winOffset, winWidth) = candidateWindow[xPeak0]!;
+
+    // The genuine overlap rectangle - the *winning window's* bounds shifted
+    // to this candidate position, clipped to what refGray actually covers -
+    // not the full template width, which for a typically-partial overlap
+    // would dilute every signal below with a majority of non-overlapping
+    // content (the same problem the windowed search above avoids for peak
+    // detection itself).
+    final refX0 = math.max(0, xPeak0 + winOffset);
+    final refX1 = math.min(refGray.cols, xPeak0 + winOffset + winWidth);
+    final refY0 = math.max(0, yPeak), refY1 = math.min(refGray.rows, yPeak + th);
+    final ow = refX1 - refX0, oh = refY1 - refY0;
+    if (ow < 40 || oh < 40) continue;
+    final tX0 = refX0 - xPeak0, tY0 = refY0 - yPeak;
+
+    var coveredPx = 0, sampled = 0;
+    for (var y = 0; y < oh; y += 4) {
+      for (var x = 0; x < ow; x += 4) {
+        sampled++;
+        if (covered((refY0 + y) * refGray.cols + (refX0 + x))) coveredPx++;
+      }
+    }
+    // Normalised by the template's *full* area, not just the intersection,
+    // so this reads as "how much of the candidate image overlaps existing
+    // content", matching what item 12 asks the diagnostic to report.
+    final overlapFraction = sampled == 0 ? 0.0 : coveredPx * (ow * oh / sampled) / (tw * th);
+    if (overlapFraction < PanoramaStitcher._yawSearchMinOverlapFraction) continue;
+
+    final templCrop = cv.Mat.fromMat(templGray, roi: cv.Rect(tX0, tY0, ow, oh), copy: true);
+    final refCrop = cv.Mat.fromMat(refGray, roi: cv.Rect(refX0, refY0, ow, oh), copy: true);
+
+    final templF = templCrop.convertTo(cv.MatType.CV_32FC1);
+    final refF = refCrop.convertTo(cv.MatType.CV_32FC1);
+    // phaseCorrelate needs a Hanning window to get a reliable response - the
+    // border discontinuity of an unwindowed crop otherwise dominates the
+    // phase spectrum and swamps genuine alignment signal (no binding for
+    // OpenCV's own createHanningWindow is available, so built by hand).
+    final hann = _hanningWindow(ow, oh);
+    final (shift, response) = cv.phaseCorrelate(templF, refF, window: hann);
+    hann.dispose();
+    final phaseScore = response.isFinite ? response.clamp(0.0, 1.0) : 0.0;
+
+    final edgeScore = _edgeCorrelationScore(templCrop, refCrop);
+    final flowScore = _flowConsistencyScore(templCrop, refCrop);
+
+    // Sub-pixel refinement of the integer matchTemplate peak using the
+    // phase-correlation residual shift.
+    final angleDeg =
+        -(xPeak0 + refWorldXAtCol0) * 180 / (f * math.pi) - shift.x * 180 / (f * math.pi);
+
+    out.add(_YawSignal(
+      angleDeg: angleDeg,
+      overlapFraction: overlapFraction.clamp(0.0, 1.0),
+      photometric: ((candidateScore[xPeak0]! + 1) / 2).clamp(0.0, 1.0),
+      phaseCorr: phaseScore,
+      edge: edgeScore,
+      flow: flowScore,
+    ));
+
+    for (final mat in [templCrop, refCrop, templF, refF]) {
+      mat.dispose();
+    }
+  }
+  templGray.dispose();
+  return out;
+}
+
+/// A separable 2D Hanning window (no binding for OpenCV's own
+/// createHanningWindow is available), needed so [cv.phaseCorrelate] isn't
+/// dominated by the crop's own border discontinuity.
+cv.Mat _hanningWindow(int cols, int rows) {
+  final data = Float32List(cols * rows);
+  for (var y = 0; y < rows; y++) {
+    final wy = rows > 1 ? 0.5 * (1 - math.cos(2 * math.pi * y / (rows - 1))) : 1.0;
+    for (var x = 0; x < cols; x++) {
+      final wx = cols > 1 ? 0.5 * (1 - math.cos(2 * math.pi * x / (cols - 1))) : 1.0;
+      data[y * cols + x] = wx * wy;
+    }
+  }
+  return cv.Mat.fromList(rows, cols, cv.MatType.CV_32FC1, data);
+}
+
+/// Canny with thresholds derived from the image's own gradient strength
+/// (a fixed absolute threshold finds nothing at all on a softened/blurred
+/// image - exactly the kind of image that reaches this recovery stage -
+/// while still being meaningful on a normal sharp one).
+cv.Mat _autoCanny(cv.Mat gray) {
+  final gx = cv.sobel(gray, cv.MatType.CV_32FC1.value, 1, 0);
+  final gy = cv.sobel(gray, cv.MatType.CV_32FC1.value, 0, 1);
+  final mag = cv.magnitude(gx, gy);
+  final (meanS, _) = cv.meanStdDev(mag);
+  gx.dispose();
+  gy.dispose();
+  mag.dispose();
+  final low = math.max(4.0, meanS.val1 * 0.5);
+  final high = math.max(low + 4, meanS.val1 * 1.5);
+  return cv.canny(gray, low, high);
+}
+
+/// Normalised cross-correlation between the two images' Canny edge maps -
+/// the "edge/line structure" alignment signal, for two already-cropped,
+/// equal-sized grayscale regions.
+double _edgeCorrelationScore(cv.Mat grayCropA, cv.Mat grayCropB) {
+  final edgesA = _autoCanny(grayCropA);
+  final edgesB = _autoCanny(grayCropB);
+  var score = 0.5;
+  if (edgesA.cols == edgesB.cols && edgesA.rows == edgesB.rows && edgesA.cols > 0 && edgesA.rows > 0) {
+    final result = cv.matchTemplate(edgesA, edgesB, cv.TM_CCOEFF_NORMED);
+    final data = result.data;
+    final v = data.buffer.asFloat32List(data.offsetInBytes, 1)[0];
+    if (v.isFinite) score = ((v + 1) / 2).clamp(0.0, 1.0);
+    result.dispose();
+  }
+  edgesA.dispose();
+  edgesB.dispose();
+  return score;
+}
+
+/// Dense-flow-consistency proxy: splits the (already globally aligned)
+/// overlap region into a grid of blocks and, for each, finds its best local
+/// match in a small search window via matchTemplate (classic block-matching
+/// optical flow) - a genuine structural alignment should leave these local
+/// residual shifts small and mutually consistent, unlike a coincidental
+/// global correlation peak. Returns 0.5 (uninformative) when the region is
+/// too small or too textureless to judge.
+double _flowConsistencyScore(cv.Mat grayCropA, cv.Mat grayCropB) {
+  final w = grayCropA.cols, h = grayCropA.rows;
+  const cols = 6, rows = 4;
+  const searchX = 6, searchY = 4;
+  final bw = w ~/ cols, bh = h ~/ rows;
+  if (bw < 12 || bh < 12) return 0.5;
+
+  final dxs = <double>[], dys = <double>[];
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      final bx = c * bw, by = r * bh;
+      final patch = cv.Mat.fromMat(grayCropA, roi: cv.Rect(bx, by, bw, bh), copy: true);
+      final winX = math.max(0, bx - searchX);
+      final winY = math.max(0, by - searchY);
+      final winW = math.min(w - winX, bw + 2 * searchX);
+      final winH = math.min(h - winY, bh + 2 * searchY);
+      if (winW >= bw && winH >= bh) {
+        final window = cv.Mat.fromMat(grayCropB, roi: cv.Rect(winX, winY, winW, winH), copy: true);
+        final res = cv.matchTemplate(window, patch, cv.TM_CCOEFF_NORMED);
+        final rw = res.cols, rh = res.rows;
+        final data = res.data.buffer.asFloat32List(res.data.offsetInBytes, rw * rh);
+        var bestV = -2.0, bestX = 0, bestY = 0;
+        for (var y = 0; y < rh; y++) {
+          for (var x = 0; x < rw; x++) {
+            final v = data[y * rw + x];
+            if (v > bestV) {
+              bestV = v;
+              bestX = x;
+              bestY = y;
+            }
+          }
+        }
+        if (bestV.isFinite && bestV > 0.2) {
+          dxs.add((winX + bestX - bx).toDouble());
+          dys.add((winY + bestY - by).toDouble());
+        }
+        res.dispose();
+        window.dispose();
+      }
+      patch.dispose();
+    }
+  }
+  if (dxs.length < 4) return 0.3;
+
+  final meanDx = dxs.reduce((a, b) => a + b) / dxs.length;
+  final meanDy = dys.reduce((a, b) => a + b) / dys.length;
+  var varSum = 0.0;
+  for (var i = 0; i < dxs.length; i++) {
+    final ddx = dxs[i] - meanDx, ddy = dys[i] - meanDy;
+    varSum += ddx * ddx + ddy * ddy;
+  }
+  final spread = math.sqrt(varSum / dxs.length);
+  return (1.0 - spread / 6.0).clamp(0.0, 1.0);
+}
+
+/// Formats one yaw-search candidate's full diagnostic line - candidate
+/// angle, overlap, feature inliers, every photometric/geometric signal, the
+/// combined score, which placed images it was scored against, and its
+/// outcome (item 12).
+String _yawCandidateLine(
+  _YawSignal s,
+  int featureInliers,
+  List<int> support,
+  double combined,
+  bool accepted,
+  String? rejectReason,
+) {
+  final supportStr = support.isEmpty ? 'none' : support.map((i) => i + 1).join(',');
+  final tag = accepted ? 'ACCEPTED' : (rejectReason ?? 'below acceptance bar');
+  return 'yaw=${s.angleDeg.toStringAsFixed(1)}° overlap=${(s.overlapFraction * 100).round()}% '
+      'features=$featureInliers photometric(NCC)=${s.photometric.toStringAsFixed(2)} '
+      'phaseCorr=${s.phaseCorr.toStringAsFixed(2)} edge=${s.edge.toStringAsFixed(2)} '
+      'flowConsistency=${s.flow.toStringAsFixed(2)} combined=${combined.toStringAsFixed(2)} '
+      'supportingImages=$supportStr [$tag]';
 }
 
 /// For every image index present in [owner] (0-254; 255 means unowned),

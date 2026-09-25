@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_compass/flutter_compass.dart';
@@ -11,6 +13,7 @@ import 'package:uuid/uuid.dart';
 import 'data/database/local_database.dart';
 import 'data/models/ground_truth_options.dart';
 import 'data/models/legacy_models.dart';
+import 'services/panorama/capture_check.dart';
 import 'services/panorama/panorama_stitcher.dart';
 import 'services/storage/storage_service.dart';
 import 'services/validation/metadata_validator.dart';
@@ -327,6 +330,18 @@ class _CapturePageState extends State<CapturePage> {
   String? panoramaId;
   double panoramaBaseHeading = 0;
   final panoramaFrames = <CaptureRecord>[];
+  // Live pre-capture check: low-passed gravity (for tilt), how much the
+  // accelerometer is jumping around (for shake), and the preview frame from
+  // the moment of the previous shot to measure the next one's overlap against.
+  List<double>? gravity;
+  List<double>? panoramaBaseGravity;
+  double shake = 0;
+  bool previewStreaming = false;
+  CameraImage? latestPreview;
+  ProbeFrame? overlapReference;
+  OverlapReading? overlapReading;
+  bool overlapProbing = false;
+  DateTime lastOverlapProbe = DateTime.fromMillisecondsSinceEpoch(0);
   @override
   void initState() {
     super.initState();
@@ -366,6 +381,18 @@ class _CapturePageState extends State<CapturePage> {
         setState(() {
           pitch = event.x;
           roll = event.y;
+          final g = gravity ?? [event.x, event.y, event.z];
+          gravity = [
+            g[0] * 0.8 + event.x * 0.2,
+            g[1] * 0.8 + event.y * 0.2,
+            g[2] * 0.8 + event.z * 0.2,
+          ];
+          final jolt = math.sqrt(
+            math.pow(event.x - gravity![0], 2) +
+                math.pow(event.y - gravity![1], 2) +
+                math.pow(event.z - gravity![2], 2),
+          );
+          shake = shake * 0.7 + jolt * 0.3;
         });
       }
     });
@@ -379,6 +406,7 @@ class _CapturePageState extends State<CapturePage> {
         );
         await camera!.initialize();
         if (mounted) setState(() {});
+        await _syncPreviewStream();
       }
     } catch (_) {
       if (mounted) {
@@ -490,30 +518,40 @@ class _CapturePageState extends State<CapturePage> {
     final invalid = MetadataValidator.validate(
       metadata('pending', ''),
     ).where((item) => !item.valid).toList();
-    if (index > 0 && heading != null) {
-      final diff = (_relativeHeading() - target + 540) % 360 - 180;
-      if (diff.abs() > _panoramaToleranceDegrees) {
-        invalid.add(
-          ValidationItem(
-            'Panorama angle',
-            false,
-            'Turn to $target° (now ${_relativeHeading().toStringAsFixed(0)}°) '
-                'without moving from this spot',
-          ),
-        );
-      }
-    }
+    // The same checks the live guide shows: a wrong heading stops the shot,
+    // anything else that may spoil the join is flagged before it is taken.
+    final issues = _panoramaIssues();
+    invalid.addAll([
+      for (final issue in issues)
+        if (issue.level == CheckLevel.block)
+          ValidationItem(issue.title, false, issue.message),
+    ]);
     if (invalid.isNotEmpty) {
       if (mounted) await showValidation(invalid);
       return;
     }
+    final warnings = [
+      for (final issue in issues)
+        if (issue.level == CheckLevel.warn) issue,
+    ];
+    if (warnings.isNotEmpty && !await _confirmDespite(warnings)) return;
     setState(() => busy = true);
     try {
       if (index == 0) {
         panoramaId = const Uuid().v4();
         panoramaBaseHeading = heading!;
+        panoramaBaseGravity = gravity;
       }
+      // The preview frame at the moment of this shot becomes what the next
+      // shot's overlap is measured against. The stream is paused for the
+      // capture itself, since not every device can stream and shoot at once.
+      final reference = latestPreview == null
+          ? null
+          : ProbeFrame.fromCameraImage(latestPreview!);
+      await _stopPreviewStream();
       final photo = await camera!.takePicture();
+      overlapReference = reference;
+      overlapReading = null;
       final id = const Uuid().v4();
       final saved = (await StorageService().saveImage(
         File(photo.path),
@@ -554,7 +592,117 @@ class _CapturePageState extends State<CapturePage> {
       if (mounted) setState(() => status = 'Capture failed: $error');
     } finally {
       if (mounted) setState(() => busy = false);
+      unawaited(_syncPreviewStream());
     }
+  }
+
+  List<CaptureIssue> _panoramaIssues() => panoramaCaptureIssues(
+    frameIndex: panoramaFrames.length,
+    targetDeg: (panoramaFrames.length * _panoramaStepDegrees).toDouble(),
+    toleranceDeg: _panoramaToleranceDegrees.toDouble(),
+    relativeHeadingDeg: heading == null || panoramaFrames.isEmpty
+        ? null
+        : _relativeHeading(),
+    gravity: gravity,
+    baseGravity: panoramaFrames.isEmpty ? null : panoramaBaseGravity,
+    shake: shake,
+    overlap: overlapReading,
+  );
+
+  /// Asks before taking a shot the live check has doubts about, rather than
+  /// taking it and finding out at stitching time.
+  Future<bool> _confirmDespite(List<CaptureIssue> warnings) async =>
+      await showModalBottomSheet<bool>(
+        context: context,
+        builder: (context) => Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'This shot may not join well',
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+              ...warnings.map(
+                (issue) => ListTile(
+                  leading: const Icon(Icons.warning_amber, color: Colors.orange),
+                  title: Text(issue.title),
+                  subtitle: Text(issue.message),
+                ),
+              ),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      child: const Text('Take anyway'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Adjust first'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ) ??
+      false;
+
+  /// Streams preview frames only while a panorama still needs shots, so the
+  /// live overlap check has something to measure.
+  Future<void> _syncPreviewStream() async {
+    final cam = camera;
+    if (cam == null || !cam.value.isInitialized || busy) return;
+    final wanted =
+        direction == panoramaDirection && panoramaFrames.length < _panoramaShots;
+    if (wanted && !previewStreaming) {
+      try {
+        await cam.startImageStream(_onPreview);
+        previewStreaming = true;
+      } catch (_) {
+        // Streaming unsupported here: the heading/tilt/shake checks still run.
+      }
+    } else if (!wanted) {
+      await _stopPreviewStream();
+    }
+  }
+
+  Future<void> _stopPreviewStream() async {
+    if (!previewStreaming) return;
+    previewStreaming = false;
+    latestPreview = null;
+    try {
+      await camera?.stopImageStream();
+    } catch (_) {}
+  }
+
+  void _onPreview(CameraImage image) {
+    latestPreview = image;
+    final reference = overlapReference;
+    if (reference == null ||
+        overlapProbing ||
+        DateTime.now().difference(lastOverlapProbe) <
+            const Duration(milliseconds: 350)) {
+      return;
+    }
+    final current = ProbeFrame.fromCameraImage(image);
+    if (current == null) return;
+    overlapProbing = true;
+    lastOverlapProbe = DateTime.now();
+    Isolate.run(() => measureOverlap(reference, current))
+        .then((reading) {
+          // Drop a result that finished after the reference changed.
+          if (mounted && identical(reference, overlapReference)) {
+            setState(() => overlapReading = reading);
+          }
+        })
+        .catchError((_) {})
+        .whenComplete(() => overlapProbing = false);
   }
 
   Future<void> stitchPanorama() async {
@@ -564,9 +712,18 @@ class _CapturePageState extends State<CapturePage> {
     );
     try {
       await _setPanoramaStatus('stitching');
-      final result = await PanoramaStitcher.stitch(
+      // Joined in the order taken: each shot to the one before it, and the
+      // last back to the first. Every shot is kept; a join with no usable
+      // visual overlap falls back to the compass headings recorded per shot.
+      final result = await PanoramaStitcher.stitchInOrder(
         panoramaFrames.map((f) => f.imagePath).toList(),
         output.path,
+        headingsDeg: [
+          for (final f in panoramaFrames)
+            (f.metadata['heading'] as num?)?.toDouble(),
+        ],
+        stepDeg: _panoramaStepDegrees.toDouble(),
+        closesLoop: true,
       );
       final id = const Uuid().v4();
       final saved = (await StorageService().saveImage(
@@ -596,13 +753,12 @@ class _CapturePageState extends State<CapturePage> {
             'descriptor_dimension': PanoramaStitcher.descriptorDimension,
             'keypoint_count': result.keypointCount,
             'reference_image_id': panoramaFrames.first.id,
-            'matching_method': result.recoveredImages.isEmpty
-                ? 'BFMatcher kNN + Lowe ratio, matched between every image '
-                      'pair (order-independent)'
-                : 'BFMatcher kNN + Lowe ratio, matched between every image '
-                      'pair (order-independent); ${result.recoveredImages.length} '
-                      'image(s) recovered via ORB re-matching or indirect '
-                      '(triangulated) agreement between two other images',
+            'matching_method':
+                'BFMatcher kNN + Lowe ratio (SIFT and ORB), each image matched '
+                'to the one taken before it (capture order), last to first '
+                'to close the loop'
+                '${result.sensorPlacedLinks.isEmpty ? '' : '; ${result.sensorPlacedLinks.length} '
+                    'join(s) with no usable visual overlap placed by compass heading'}',
             'ratio_test_threshold': PanoramaStitcher.ratioThreshold,
             'total_matches': result.totalMatches,
             'good_matches': result.goodMatches,
@@ -610,10 +766,9 @@ class _CapturePageState extends State<CapturePage> {
             'ransac_threshold': PanoramaStitcher.ransacThreshold,
             'inlier_count': result.inlierCount,
             'inlier_ratio': result.inlierRatio,
-            // Every image placed in the panorama is backed by a validated
-            // homography - there is no non-visual fallback - so this is
-            // always true for a panorama that reached 'completed'.
-            'homography_valid': true,
+            // False when any join was placed by compass rather than a
+            // validated homography.
+            'homography_valid': result.sensorPlacedLinks.isEmpty,
           },
           createdAt: DateTime.now(),
         ),
@@ -630,16 +785,18 @@ class _CapturePageState extends State<CapturePage> {
       if (droppedIds.isNotEmpty) {
         await _setPanoramaStatus('excluded_no_overlap', onlyIds: droppedIds);
       }
-      final recoveredCount = result.recoveredImages.length;
+      final sensorJoins = result.sensorPlacedLinks.length;
       panoramaFrames.clear();
       panoramaId = null;
+      overlapReference = null;
+      overlapReading = null;
       unawaited(SyncService().syncPending());
       if (mounted) {
         setState(
           () => status =
               'Panorama saved: $id.jpg (${result.width}x${result.height}) '
               'from ${result.usedImageCount} of $_panoramaShots images'
-              '${recoveredCount == 0 ? '' : ', $recoveredCount recovered via indirect matching'}'
+              '${sensorJoins == 0 ? '' : ', $sensorJoins join(s) placed by compass'}'
               '${droppedIds.isEmpty ? '' : ' (${droppedIds.length} shared no overlap and were left out)'}',
         );
         if (result.dropReasons.isNotEmpty) {
@@ -673,6 +830,7 @@ class _CapturePageState extends State<CapturePage> {
     } finally {
       if (await output.exists()) await output.delete();
       if (mounted) setState(() => busy = false);
+      unawaited(_syncPreviewStream());
     }
   }
 
@@ -709,7 +867,10 @@ class _CapturePageState extends State<CapturePage> {
     }
     panoramaFrames.clear();
     panoramaId = null;
+    overlapReference = null;
+    overlapReading = null;
     if (mounted) setState(() => direction = value);
+    await _syncPreviewStream();
   }
 
   Future<void> showValidation(
@@ -822,20 +983,37 @@ class _CapturePageState extends State<CapturePage> {
     final now = heading == null || panoramaFrames.isEmpty
         ? '--'
         : '${_relativeHeading().toStringAsFixed(0)}°';
+    final issues = done ? <CaptureIssue>[] : _panoramaIssues();
+    final overlap = overlapReading?.overlap;
     return Padding(
       padding: const EdgeInsets.only(top: 8),
-      child: Text(
-        done
-            ? 'Panorama: press capture to retry stitching'
-            : 'Panorama ${panoramaFrames.length + 1}/$_panoramaShots — '
-                  'face $target° (now $now)',
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.bold,
-        ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            done
+                ? 'Panorama: press capture to retry stitching'
+                : 'Panorama ${panoramaFrames.length + 1}/$_panoramaShots — '
+                      'face $target° (now $now)'
+                      '${overlap == null || panoramaFrames.isEmpty ? '' : ' · overlap ${(overlap * 100).round()}%'}',
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          if (!done && issues.isEmpty)
+            const _CheckLine(Icons.check_circle, Colors.greenAccent, 'Good angle — take the shot'),
+          for (final issue in issues)
+            _CheckLine(
+              issue.level == CheckLevel.block ? Icons.block : Icons.warning_amber,
+              issue.level == CheckLevel.block ? Colors.redAccent : Colors.orangeAccent,
+              issue.message,
+            ),
+        ],
       ),
     );
   }
+
 
   Widget _groundTruthSection() => Container(
     padding: const EdgeInsets.all(10),
@@ -975,6 +1153,27 @@ class _CapturePageState extends State<CapturePage> {
               if (value != null) onChanged(value);
             }
           : null,
+    ),
+  );
+}
+
+class _CheckLine extends StatelessWidget {
+  const _CheckLine(this.icon, this.color, this.text);
+  final IconData icon;
+  final Color color;
+  final String text;
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(top: 4),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, color: color, size: 16),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(text, style: TextStyle(color: color, fontSize: 12)),
+        ),
+      ],
     ),
   );
 }
