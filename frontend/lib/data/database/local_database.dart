@@ -96,6 +96,13 @@ class LocalDatabase {
         where: 'id = ?',
         whereArgs: [sessionId],
       );
+  Future<void> updateSessionStatus(String sessionId, String status) async =>
+      (await database).update(
+        'sessions',
+        {'status': status},
+        where: 'id = ?',
+        whereArgs: [sessionId],
+      );
   Future<List<CaptureSession>> sessions() async => (await database)
       .query('sessions', orderBy: 'created_at DESC')
       .then((rows) => rows.map(CaptureSession.fromMap).toList());

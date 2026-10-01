@@ -34,10 +34,12 @@ class ManualCapturePage extends StatefulWidget {
   const ManualCapturePage({
     super.key,
     required this.session,
+    this.selectedCamera,
     this.prefilledMetadata,
   });
 
   final CaptureSession session;
+  final CameraDescription? selectedCamera;
   final Map<String, dynamic>? prefilledMetadata;
 
   @override
@@ -45,7 +47,7 @@ class ManualCapturePage extends StatefulWidget {
 }
 
 class _ManualCapturePageState extends State<ManualCapturePage> {
-  static const int photoCount = 8;
+  static const int panoramaFrameCount = 8;
 
   CameraController? camera;
   CameraDescription? cameraDescription;
@@ -65,7 +67,6 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
   late String panoramaId;
   final List<CaptureRecord> captured = [];
 
-  bool reviewing = false;
   bool busy = false;
   bool flash = false;
   String status = 'Initializing rear wide-angle camera...';
@@ -98,16 +99,14 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
 
   void _initMetadata() {
     final meta = widget.prefilledMetadata;
-    sessionName =
-        meta?['session_name'] as String? ?? widget.session.name;
+    sessionName = meta?['session_name'] as String? ?? widget.session.name;
     groundTruthCampus =
         meta?['ground_truth_campus'] as String? ?? defaultGroundTruthCampus;
     groundTruthBuilding =
         meta?['ground_truth_building'] as String? ??
         groundTruthBuildingOptions.first;
     groundTruthFloor =
-        meta?['ground_truth_floor'] as String? ??
-        groundTruthFloorOptions.first;
+        meta?['ground_truth_floor'] as String? ?? groundTruthFloorOptions.first;
     groundTruthNodeName =
         meta?['ground_truth_node_name'] as String? ?? 'Node 1';
     groundTruthLocalX = meta?['ground_truth_local_x'] as double?;
@@ -116,8 +115,7 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
     lightingCondition =
         meta?['lighting_condition'] as String? ??
         lightingConditionOptions.first;
-    crowdLevel =
-        meta?['crowd_level'] as String? ?? crowdLevelOptions.first;
+    crowdLevel = meta?['crowd_level'] as String? ?? crowdLevelOptions.first;
     occlusionLevel =
         meta?['occlusion_level'] as String? ?? occlusionLevelOptions.first;
     sceneCondition =
@@ -133,14 +131,15 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
         await Geolocator.requestPermission();
       }
       position = await Geolocator.getCurrentPosition();
-      locationSub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.best,
-          distanceFilter: 1,
-        ),
-      ).listen((value) {
-        if (mounted) setState(() => position = value);
-      });
+      locationSub =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.best,
+              distanceFilter: 1,
+            ),
+          ).listen((value) {
+            if (mounted) setState(() => position = value);
+          });
     } catch (_) {}
 
     // Compass for heading orientation metadata & display guidance
@@ -186,7 +185,8 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
       if (cameras.isEmpty) {
         throw StateError('No cameras available on this device');
       }
-      cameraDescription = await selectWideAngleRearCamera(cameras);
+      cameraDescription =
+          widget.selectedCamera ?? await selectWideAngleRearCamera(cameras);
       final controller = CameraController(
         cameraDescription!,
         ResolutionPreset.high,
@@ -197,7 +197,7 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
       if (mounted) {
         setState(() {
           cameraError = null;
-          status = 'Photo 1 of $photoCount — Rotate clockwise ~45°';
+          status = 'Ready to capture. Rotate clockwise between photos.';
         });
       }
     } catch (error) {
@@ -222,11 +222,11 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
   }
 
   Future<void> _capture() async {
-    if (!cameraReady || busy || captured.length >= photoCount) return;
+    if (!cameraReady || busy) return;
     setState(() => busy = true);
 
     try {
-      final frameIndex = captured.length;
+      final frameIndex = captured.length % panoramaFrameCount;
       final photo = await camera!.takePicture();
       final imageId = const Uuid().v4();
       final saved = (await StorageService().saveImage(
@@ -259,18 +259,18 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
         createdAt: DateTime.now(),
       );
 
+      await LocalDatabase.instance.saveCapture(record);
       captured.add(record);
+      unawaited(SyncService().syncPending());
+      final panoramaComplete = frameIndex == panoramaFrameCount - 1;
+      if (panoramaComplete) panoramaId = const Uuid().v4();
 
       if (mounted) {
         setState(() {
           flash = true;
-          if (captured.length == photoCount) {
-            reviewing = true;
-            status = 'All 8 photos captured. Review your panorama.';
-          } else {
-            status =
-                'Photo ${captured.length + 1} of $photoCount — Rotate clockwise ~45°';
-          }
+          status = panoramaComplete
+              ? 'Panorama saved. Continue capturing the next panorama.'
+              : 'Photo saved. ${captured.length} captured this session.';
         });
       }
 
@@ -373,63 +373,14 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
     };
   }
 
-  Future<void> _savePanorama() async {
+  Future<void> _stopAndSaveSession() async {
     if (busy) return;
-    setState(() => busy = true);
-    try {
-      for (final record in captured) {
-        await LocalDatabase.instance.saveCapture(record);
-      }
-      unawaited(SyncService().syncPending());
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Manual panorama (8 photos) saved successfully.'),
-          ),
-        );
-        Navigator.pop(context, true);
-      }
-    } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to save panorama: $error')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> _retakePanorama() async {
-    setState(() => busy = true);
-    try {
-      for (final record in captured) {
-        final file = File(record.imagePath);
-        if (await file.exists()) {
-          await file.delete();
-        }
-      }
-      captured.clear();
-      panoramaId = const Uuid().v4();
-      if (mounted) {
-        setState(() {
-          reviewing = false;
-          status = 'Photo 1 of $photoCount — Rotate clockwise ~45°';
-        });
-      }
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> _confirmReset() async {
-    if (captured.isEmpty) return;
-    final shouldReset = await showDialog<bool>(
+    final shouldStop = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Reset panorama?'),
+        title: const Text('Stop and save session?'),
         content: Text(
-          'Discard all ${captured.length} captured photo(s) and start from photo 1?',
+          '${captured.length} photo(s) have been saved to this session. Stop capturing now?',
         ),
         actions: [
           TextButton(
@@ -438,52 +389,29 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Reset'),
+            child: const Text('Stop and save'),
           ),
         ],
       ),
     );
 
-    if (shouldReset == true) {
-      await _retakePanorama();
-    }
-  }
-
-  Future<void> _confirmExit() async {
-    if (captured.isEmpty) {
-      Navigator.pop(context);
-      return;
-    }
-    final shouldExit = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Exit panorama capture?'),
-        content: Text(
-          'Captured ${captured.length} of $photoCount photos will be discarded.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Keep capturing'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Discard and exit'),
-          ),
-        ],
-      ),
-    );
-
-    if (shouldExit == true) {
-      for (final record in captured) {
-        final file = File(record.imagePath);
-        if (await file.exists()) {
-          await file.delete();
-        }
+    if (shouldStop != true || !mounted) return;
+    setState(() => busy = true);
+    try {
+      await LocalDatabase.instance.updateSessionStatus(
+        widget.session.id,
+        'completed',
+      );
+      unawaited(SyncService().syncPending());
+      if (mounted) Navigator.pop(context, true);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save session: $error')),
+        );
       }
-      captured.clear();
-      if (mounted) Navigator.pop(context);
+    } finally {
+      if (mounted) setState(() => busy = false);
     }
   }
 
@@ -521,33 +449,27 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
       );
 
   @override
-  Widget build(BuildContext context) {
-    if (reviewing) {
-      return _buildReviewScreen();
-    }
-    return _buildCaptureScreen();
-  }
+  Widget build(BuildContext context) => _buildCaptureScreen();
 
   Widget _buildCaptureScreen() => PopScope<void>(
-    canPop: captured.isEmpty,
+    canPop: false,
     onPopInvokedWithResult: (didPop, result) {
-      if (!didPop) unawaited(_confirmExit());
+      if (!didPop) unawaited(_stopAndSaveSession());
     },
     child: Scaffold(
       appBar: AppBar(
         title: const Text('Manual Panorama'),
         leading: IconButton(
-          icon: const Icon(Icons.close),
-          tooltip: 'Exit capture',
-          onPressed: _confirmExit,
+          icon: const Icon(Icons.stop_circle_outlined),
+          tooltip: 'Stop and save session',
+          onPressed: busy ? null : _stopAndSaveSession,
         ),
         actions: [
-          if (captured.isNotEmpty)
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              tooltip: 'Reset to photo 1',
-              onPressed: _confirmReset,
-            ),
+          TextButton.icon(
+            onPressed: busy ? null : _stopAndSaveSession,
+            icon: const Icon(Icons.save_outlined),
+            label: const Text('Stop & Save'),
+          ),
         ],
       ),
       body: cameraError != null
@@ -608,16 +530,11 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
           'HEADING',
           heading == null ? '--' : '${heading!.toStringAsFixed(0)}°',
         ),
-        _metric(
-          'PITCH',
-          pitch == null ? '--' : pitch!.toStringAsFixed(1),
-        ),
+        _metric('PITCH', pitch == null ? '--' : pitch!.toStringAsFixed(1)),
         _metric('ROLL', roll == null ? '--' : roll!.toStringAsFixed(1)),
         _metric(
           'GPS',
-          position == null
-              ? '--'
-              : '${position!.accuracy.toStringAsFixed(1)}m',
+          position == null ? '--' : '${position!.accuracy.toStringAsFixed(1)}m',
         ),
       ],
     ),
@@ -626,10 +543,7 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
   Widget _metric(String label, String value) => Column(
     mainAxisSize: MainAxisSize.min,
     children: [
-      Text(
-        label,
-        style: const TextStyle(color: Colors.white70, fontSize: 10),
-      ),
+      Text(label, style: const TextStyle(color: Colors.white70, fontSize: 10)),
       Text(
         value,
         style: const TextStyle(
@@ -652,7 +566,7 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                'Photo ${captured.length + 1} / $photoCount',
+                'Photo ${(captured.length % panoramaFrameCount) + 1} in panorama',
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 20,
@@ -660,22 +574,14 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
                 ),
               ),
               Text(
-                '${captured.length} of $photoCount captured',
+                '${captured.length} captured this session',
                 style: const TextStyle(color: Colors.white70),
               ),
             ],
           ),
-          const SizedBox(height: 8),
-          LinearProgressIndicator(
-            value: captured.length / photoCount,
-            backgroundColor: Colors.white24,
-            color: Colors.tealAccent,
-            minHeight: 6,
-            borderRadius: BorderRadius.circular(3),
-          ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 12),
           Text(
-            'Photo ${captured.length + 1} of $photoCount — Rotate clockwise ~45°',
+            'Rotate clockwise between photos. Session has no photo limit.',
             style: const TextStyle(
               color: Colors.tealAccent,
               fontSize: 15,
@@ -693,11 +599,7 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
               shape: const CircleBorder(),
               child: busy
                   ? const CircularProgressIndicator(color: Colors.white)
-                  : const Icon(
-                      Icons.camera_alt,
-                      size: 38,
-                      color: Colors.white,
-                    ),
+                  : const Icon(Icons.camera_alt, size: 38, color: Colors.white),
             ),
           ),
         ],
@@ -750,94 +652,6 @@ class _ManualCapturePageState extends State<ManualCapturePage> {
           ),
         ),
       ),
-    ),
-  );
-
-  Widget _buildReviewScreen() => Scaffold(
-    appBar: AppBar(
-      title: const Text('Panorama Review'),
-      automaticallyImplyLeading: false,
-    ),
-    body: ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        const Icon(Icons.check_circle_outline, color: Colors.teal, size: 56),
-        const SizedBox(height: 8),
-        Center(
-          child: Text(
-            '$photoCount photos captured',
-            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                  fontWeight: FontWeight.bold,
-                ),
-          ),
-        ),
-        const Center(
-          child: Text(
-            'Review all frames before saving the panorama to dataset.',
-            style: TextStyle(color: Colors.black54),
-          ),
-        ),
-        const SizedBox(height: 16),
-        GridView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 4,
-            crossAxisSpacing: 8,
-            mainAxisSpacing: 8,
-            childAspectRatio: 0.82,
-          ),
-          itemCount: captured.length,
-          itemBuilder: (context, index) {
-            final record = captured[index];
-            final headingVal = record.metadata['heading'];
-            return ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  Image.file(File(record.imagePath), fit: BoxFit.cover),
-                  Positioned(
-                    bottom: 0,
-                    left: 0,
-                    right: 0,
-                    child: Container(
-                      color: Colors.black54,
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Text(
-                        '#${index + 1} (${record.metadata['frame_index']})\n${headingVal != null ? "${(headingVal as num).toStringAsFixed(0)}°" : "--"}',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 9,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 24),
-        FilledButton.icon(
-          onPressed: busy ? null : _savePanorama,
-          icon: const Icon(Icons.save),
-          label: const Text('Save Panorama'),
-          style: FilledButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 14),
-          ),
-        ),
-        const SizedBox(height: 10),
-        OutlinedButton.icon(
-          onPressed: busy ? null : _retakePanorama,
-          icon: const Icon(Icons.refresh),
-          label: const Text('Retake Panorama'),
-          style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 14),
-          ),
-        ),
-      ],
     ),
   );
 }

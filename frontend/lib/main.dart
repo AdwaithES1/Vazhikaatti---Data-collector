@@ -17,6 +17,7 @@ import 'services/api/session_api.dart';
 import 'services/sync/sync_page.dart';
 import 'services/sync/sync_service.dart';
 import 'services/capture/gyro_sweep_page.dart';
+import 'services/capture/camera_setup_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,12 +35,18 @@ class VazhikattiApp extends StatelessWidget {
       scaffoldBackgroundColor: const Color(0xfff4f7f5),
       useMaterial3: true,
     ),
-    home: const HomePage(),
+    home: CameraSetupPage(
+      onSelected: (setupContext, camera) =>
+          Navigator.of(setupContext).pushReplacement(
+        MaterialPageRoute(builder: (_) => HomePage(selectedCamera: camera)),
+      ),
+    ),
   );
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, required this.selectedCamera});
+  final CameraDescription selectedCamera;
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -102,7 +109,12 @@ class _HomePageState extends State<HomePage> {
     if (mounted) {
       await Navigator.push(
         context,
-        MaterialPageRoute(builder: (_) => CaptureModePage(session: session)),
+              MaterialPageRoute(
+                builder: (_) => CaptureModePage(
+                  session: session,
+                  selectedCamera: widget.selectedCamera,
+                ),
+              ),
       );
     }
     await load();
@@ -318,8 +330,9 @@ class _HomePageState extends State<HomePage> {
 }
 
 class CapturePage extends StatefulWidget {
-  const CapturePage({super.key, required this.session});
+  const CapturePage({super.key, required this.session, this.selectedCamera});
   final CaptureSession session;
+  final CameraDescription? selectedCamera;
   @override
   State<CapturePage> createState() => _CapturePageState();
 }
@@ -386,9 +399,11 @@ class _CapturePageState extends State<CapturePage> {
     });
     try {
       final cameras = await availableCameras();
+      final selected = widget.selectedCamera ??
+          await selectWideAngleRearCamera(cameras);
       if (cameras.isNotEmpty) {
         camera = CameraController(
-          cameras.first,
+          selected,
           ResolutionPreset.high,
           enableAudio: false,
         );

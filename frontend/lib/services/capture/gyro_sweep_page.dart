@@ -22,8 +22,13 @@ import 'manual_capture_page.dart';
 export 'camera_selection_service.dart';
 
 class CaptureModePage extends StatefulWidget {
-  const CaptureModePage({super.key, required this.session});
+  const CaptureModePage({
+    super.key,
+    required this.session,
+    this.selectedCamera,
+  });
   final CaptureSession session;
+  final CameraDescription? selectedCamera;
 
   @override
   State<CaptureModePage> createState() => _CaptureModePageState();
@@ -81,12 +86,15 @@ class _CaptureModePageState extends State<CaptureModePage> {
     'ground_truth_building': groundTruthBuilding,
     'ground_truth_floor': groundTruthFloor,
     'ground_truth_node_name': groundTruthNodeNameController.text.trim(),
-    'ground_truth_local_x':
-        double.tryParse(groundTruthLocalXController.text.trim()),
-    'ground_truth_local_y':
-        double.tryParse(groundTruthLocalYController.text.trim()),
-    'ground_truth_local_z':
-        double.tryParse(groundTruthLocalZController.text.trim()),
+    'ground_truth_local_x': double.tryParse(
+      groundTruthLocalXController.text.trim(),
+    ),
+    'ground_truth_local_y': double.tryParse(
+      groundTruthLocalYController.text.trim(),
+    ),
+    'ground_truth_local_z': double.tryParse(
+      groundTruthLocalZController.text.trim(),
+    ),
     'lighting_condition': lightingCondition,
     'crowd_level': crowdLevel,
     'occlusion_level': occlusionLevel,
@@ -109,6 +117,7 @@ class _CaptureModePageState extends State<CaptureModePage> {
       MaterialPageRoute(
         builder: (_) => GyroSweepPage(
           session: widget.session,
+          selectedCamera: widget.selectedCamera,
           prefilledMetadata: _gatherMetadata(),
         ),
       ),
@@ -138,6 +147,7 @@ class _CaptureModePageState extends State<CaptureModePage> {
       MaterialPageRoute(
         builder: (_) => ManualCapturePage(
           session: widget.session,
+          selectedCamera: widget.selectedCamera,
           prefilledMetadata: _gatherMetadata(),
         ),
       ),
@@ -215,13 +225,14 @@ class _CaptureModePageState extends State<CaptureModePage> {
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
                   initialValue: groundTruthCampus,
-                  decoration:
-                      const InputDecoration(labelText: 'Ground Truth Campus'),
+                  decoration: const InputDecoration(
+                    labelText: 'Ground Truth Campus',
+                  ),
                   items: groundTruthCampusOptions
-                      .map((value) => DropdownMenuItem(
-                            value: value,
-                            child: Text(value),
-                          ))
+                      .map(
+                        (value) =>
+                            DropdownMenuItem(value: value, child: Text(value)),
+                      )
                       .toList(),
                   onChanged: (value) =>
                       setState(() => groundTruthCampus = value!),
@@ -236,10 +247,12 @@ class _CaptureModePageState extends State<CaptureModePage> {
                           labelText: 'Building',
                         ),
                         items: groundTruthBuildingOptions
-                            .map((value) => DropdownMenuItem(
-                                  value: value,
-                                  child: Text(value),
-                                ))
+                            .map(
+                              (value) => DropdownMenuItem(
+                                value: value,
+                                child: Text(value),
+                              ),
+                            )
                             .toList(),
                         onChanged: (value) =>
                             setState(() => groundTruthBuilding = value),
@@ -251,10 +264,12 @@ class _CaptureModePageState extends State<CaptureModePage> {
                         initialValue: groundTruthFloor,
                         decoration: const InputDecoration(labelText: 'Floor'),
                         items: groundTruthFloorOptions
-                            .map((value) => DropdownMenuItem(
-                                  value: value,
-                                  child: Text(value),
-                                ))
+                            .map(
+                              (value) => DropdownMenuItem(
+                                value: value,
+                                child: Text(value),
+                              ),
+                            )
                             .toList(),
                         onChanged: (value) =>
                             setState(() => groundTruthFloor = value),
@@ -309,11 +324,13 @@ class _CaptureModePageState extends State<CaptureModePage> {
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
                   initialValue: lightingCondition,
-                  decoration:
-                      const InputDecoration(labelText: 'Lighting Condition'),
+                  decoration: const InputDecoration(
+                    labelText: 'Lighting Condition',
+                  ),
                   items: lightingConditionOptions
-                      .map((val) =>
-                          DropdownMenuItem(value: val, child: Text(val)))
+                      .map(
+                        (val) => DropdownMenuItem(value: val, child: Text(val)),
+                      )
                       .toList(),
                   onChanged: (val) => setState(() => lightingCondition = val),
                 ),
@@ -323,11 +340,16 @@ class _CaptureModePageState extends State<CaptureModePage> {
                     Expanded(
                       child: DropdownButtonFormField<String>(
                         initialValue: crowdLevel,
-                        decoration:
-                            const InputDecoration(labelText: 'Crowd Level'),
+                        decoration: const InputDecoration(
+                          labelText: 'Crowd Level',
+                        ),
                         items: crowdLevelOptions
-                            .map((val) =>
-                                DropdownMenuItem(value: val, child: Text(val)))
+                            .map(
+                              (val) => DropdownMenuItem(
+                                value: val,
+                                child: Text(val),
+                              ),
+                            )
                             .toList(),
                         onChanged: (val) => setState(() => crowdLevel = val),
                       ),
@@ -340,8 +362,12 @@ class _CaptureModePageState extends State<CaptureModePage> {
                           labelText: 'Occlusion Level',
                         ),
                         items: occlusionLevelOptions
-                            .map((val) =>
-                                DropdownMenuItem(value: val, child: Text(val)))
+                            .map(
+                              (val) => DropdownMenuItem(
+                                value: val,
+                                child: Text(val),
+                              ),
+                            )
                             .toList(),
                         onChanged: (val) =>
                             setState(() => occlusionLevel = val),
@@ -352,11 +378,13 @@ class _CaptureModePageState extends State<CaptureModePage> {
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
                   initialValue: sceneCondition,
-                  decoration:
-                      const InputDecoration(labelText: 'Scene Condition'),
+                  decoration: const InputDecoration(
+                    labelText: 'Scene Condition',
+                  ),
                   items: sceneConditionOptions
-                      .map((val) =>
-                          DropdownMenuItem(value: val, child: Text(val)))
+                      .map(
+                        (val) => DropdownMenuItem(value: val, child: Text(val)),
+                      )
                       .toList(),
                   onChanged: (val) => setState(() => sceneCondition = val),
                 ),
@@ -373,9 +401,11 @@ class GyroSweepPage extends StatefulWidget {
   const GyroSweepPage({
     super.key,
     required this.session,
+    this.selectedCamera,
     this.prefilledMetadata,
   });
   final CaptureSession session;
+  final CameraDescription? selectedCamera;
   final Map<String, dynamic>? prefilledMetadata;
 
   @override
@@ -413,9 +443,10 @@ class _GyroSweepPageState extends State<GyroSweepPage>
   String? sweepId;
   String? errorMessage;
   bool sweepActive = false;
-  bool sweepComplete = false;
+  bool stoppingSession = false;
   bool busy = false;
   bool flash = false;
+  int sweepCaptureCount = 0;
   Future<void> _captureQueue = Future<void>.value();
 
   bool get cameraReady => camera?.value.isInitialized == true;
@@ -455,16 +486,19 @@ class _GyroSweepPageState extends State<GyroSweepPage>
           widget.prefilledMetadata!['ground_truth_node_name'] as String;
     }
     if (widget.prefilledMetadata?['ground_truth_local_x'] != null) {
-      groundTruthLocalXController.text =
-          widget.prefilledMetadata!['ground_truth_local_x'].toString();
+      groundTruthLocalXController.text = widget
+          .prefilledMetadata!['ground_truth_local_x']
+          .toString();
     }
     if (widget.prefilledMetadata?['ground_truth_local_y'] != null) {
-      groundTruthLocalYController.text =
-          widget.prefilledMetadata!['ground_truth_local_y'].toString();
+      groundTruthLocalYController.text = widget
+          .prefilledMetadata!['ground_truth_local_y']
+          .toString();
     }
     if (widget.prefilledMetadata?['ground_truth_local_z'] != null) {
-      groundTruthLocalZController.text =
-          widget.prefilledMetadata!['ground_truth_local_z'].toString();
+      groundTruthLocalZController.text = widget
+          .prefilledMetadata!['ground_truth_local_z']
+          .toString();
     }
     lightingCondition =
         widget.prefilledMetadata?['lighting_condition'] as String? ??
@@ -548,8 +582,11 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     }
     try {
       final cameras = await availableCameras();
-      if (cameras.isEmpty) throw StateError('No camera found');
-      cameraDescription = await selectWideAngleRearCamera(cameras);
+      if (cameras.isEmpty && widget.selectedCamera == null) {
+        throw StateError('No camera found');
+      }
+      cameraDescription =
+          widget.selectedCamera ?? await selectWideAngleRearCamera(cameras);
       camera = CameraController(
         cameraDescription!,
         ResolutionPreset.high,
@@ -580,7 +617,7 @@ class _GyroSweepPageState extends State<GyroSweepPage>
       _queueCapture(update);
     }
     if (update.cumulativeRotation >= 350 && update.triggerInterval == null) {
-      unawaited(_captureQueue.then((_) => _finishSweep()));
+      unawaited(_captureQueue.then((_) => _finishSweep(currentTracker)));
     }
   }
 
@@ -595,9 +632,8 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     setState(() {
       sweepId = const Uuid().v4();
       tracker = GyroSweepTracker(initialHeading: initialHeading);
-      captured.clear();
+      sweepCaptureCount = 0;
       sweepActive = true;
-      sweepComplete = false;
       errorMessage = null;
       status = 'Rotate slowly through each 45° interval.';
     });
@@ -642,9 +678,8 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     setState(() {
       sweepId = const Uuid().v4();
       tracker = GyroSweepTracker(initialHeading: heading!);
-      captured.clear();
+      sweepCaptureCount = 0;
       sweepActive = true;
-      sweepComplete = false;
       errorMessage = null;
       status = 'Rotate slowly through each 45° interval.';
     });
@@ -656,7 +691,9 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     if (activeSweepId == null || currentTracker == null) return;
     _captureQueue = _captureQueue.then((_) async {
       await _capture(update, activeSweepId, currentTracker);
-      if (currentTracker.cumulativeRotation >= 350) _finishSweep();
+      if (currentTracker.cumulativeRotation >= 350) {
+        _finishSweep(currentTracker);
+      }
     });
   }
 
@@ -702,6 +739,7 @@ class _GyroSweepPageState extends State<GyroSweepPage>
       );
       await LocalDatabase.instance.saveCapture(record);
       captured.add(record);
+      sweepCaptureCount++;
       unawaited(_flashCapture());
       unawaited(SyncService().syncPending());
       if (mounted) {
@@ -755,7 +793,7 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     'overlap_group_id': activeSweepId,
     'is_panorama_source': true,
     'panorama_status': 'in_progress',
-    'frame_index': captured.length,
+    'frame_index': sweepCaptureCount,
     'preprocessing_version': 'unprocessed',
     'feature_method': null,
     'matching_method': null,
@@ -775,7 +813,7 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     'session_name': sessionNameController.text.trim(),
     'predicted_floor': null,
     'sweep_id': activeSweepId,
-    'sweep_index': captured.length,
+    'sweep_index': sweepCaptureCount,
     'heading_at_capture': update.heading,
     'sweep_trigger_interval_degrees': triggerIntervalDegrees,
     'sweep_direction': currentTracker.direction,
@@ -827,13 +865,59 @@ class _GyroSweepPageState extends State<GyroSweepPage>
     if (mounted) setState(() => flash = false);
   }
 
-  void _finishSweep() {
-    if (!sweepActive) return;
+  void _finishSweep(GyroSweepTracker completedTracker) {
+    if (!sweepActive || !identical(tracker, completedTracker)) return;
     setState(() {
-      sweepActive = false;
-      sweepComplete = true;
-      status = 'Sweep complete.';
+      sweepId = const Uuid().v4();
+      tracker = GyroSweepTracker(initialHeading: heading ?? 0);
+      sweepCaptureCount = 0;
+      status = 'Full rotation captured. Continue rotating for the next sweep.';
     });
+  }
+
+  Future<void> _stopAndSaveSession() async {
+    if (stoppingSession) return;
+    final shouldStop = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Stop and save session?'),
+        content: Text(
+          '${captured.length} photo(s) have been saved to this session. Stop capturing now?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Continue capturing'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Stop and save'),
+          ),
+        ],
+      ),
+    );
+    if (shouldStop != true || !mounted) return;
+    setState(() {
+      stoppingSession = true;
+      sweepActive = false;
+      status = 'Saving session...';
+    });
+    try {
+      await _captureQueue;
+      await LocalDatabase.instance.updateSessionStatus(
+        widget.session.id,
+        'completed',
+      );
+      unawaited(SyncService().syncPending());
+      if (mounted) Navigator.pop(context, true);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          stoppingSession = false;
+          status = 'Failed to save session: $error';
+        });
+      }
+    }
   }
 
   Future<void> _showValidation(List<ValidationItem> invalid) =>
@@ -881,8 +965,7 @@ class _GyroSweepPageState extends State<GyroSweepPage>
 
   @override
   Widget build(BuildContext context) {
-    if (sweepComplete) return _completionScreen();
-    if (sweepActive) return _activeSweepScreen();
+    if (sweepActive || stoppingSession) return _activeSweepScreen();
     return Scaffold(
       appBar: AppBar(title: Text(widget.session.name)),
       body: ListView(
@@ -899,10 +982,19 @@ class _GyroSweepPageState extends State<GyroSweepPage>
   Widget _activeSweepScreen() => PopScope<void>(
     canPop: false,
     onPopInvokedWithResult: (didPop, result) {
-      if (!didPop) unawaited(_confirmExitSweep());
+      if (!didPop) unawaited(_stopAndSaveSession());
     },
     child: Scaffold(
-      appBar: AppBar(title: const Text('Gyro Sweep')),
+      appBar: AppBar(
+        title: const Text('Gyro Sweep'),
+        actions: [
+          TextButton.icon(
+            onPressed: stoppingSession ? null : _stopAndSaveSession,
+            icon: const Icon(Icons.save_outlined),
+            label: const Text('Stop & Save'),
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(child: _preview()),
@@ -911,30 +1003,6 @@ class _GyroSweepPageState extends State<GyroSweepPage>
       ),
     ),
   );
-
-  Future<void> _confirmExitSweep() async {
-    if (!mounted || !sweepActive) return;
-    final shouldExit = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Exit sweep?'),
-        content: const Text(
-          'Captured images from this sweep will be discarded.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Continue sweep'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Exit sweep'),
-          ),
-        ],
-      ),
-    );
-    if (shouldExit == true && mounted) Navigator.pop(context);
-  }
 
   Widget _preview({double? height}) => SizedBox(
     height: height,
@@ -1264,48 +1332,4 @@ class _GyroSweepPageState extends State<GyroSweepPage>
         .toList(),
     onChanged: onChanged,
   );
-
-  Widget _completionScreen() {
-    final total = tracker?.cumulativeRotation ?? 0;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Sweep complete')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          const Icon(Icons.check_circle, color: Colors.teal, size: 64),
-          const SizedBox(height: 12),
-          Text(
-            '${captured.length} images captured',
-            style: Theme.of(context).textTheme.headlineSmall,
-          ),
-          Text('Sweep ID: ${sweepId ?? '--'}'),
-          Text('Total rotation: ${total.toStringAsFixed(1)}°'),
-          const SizedBox(height: 18),
-          GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 3,
-              crossAxisSpacing: 6,
-              mainAxisSpacing: 6,
-            ),
-            itemCount: captured.length,
-            itemBuilder: (_, index) =>
-                Image.file(File(captured[index].imagePath), fit: BoxFit.cover),
-          ),
-          const SizedBox(height: 20),
-          FilledButton.icon(
-            onPressed: () => Navigator.pop(context),
-            icon: const Icon(Icons.save),
-            label: const Text('Save Sweep'),
-          ),
-          OutlinedButton.icon(
-            onPressed: _redoSweep,
-            icon: const Icon(Icons.refresh),
-            label: const Text('Redo Sweep'),
-          ),
-        ],
-      ),
-    );
-  }
 }

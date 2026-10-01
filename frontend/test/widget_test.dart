@@ -79,23 +79,26 @@ void main() {
     },
   );
 
-  test('wide-angle selector throws error when rear wide camera is absent', () async {
-    expect(
-      () => selectWideAngleRearCamera([
-        const CameraDescription(
-          name: '0',
-          lensDirection: CameraLensDirection.back,
-          sensorOrientation: 90,
-        ),
-        const CameraDescription(
-          name: '1',
-          lensDirection: CameraLensDirection.front,
-          sensorOrientation: 270,
-        ),
-      ]),
-      throwsA(isA<StateError>()),
-    );
-  });
+  test(
+    'wide-angle selector throws error when rear wide camera is absent',
+    () async {
+      expect(
+        () => selectWideAngleRearCamera([
+          const CameraDescription(
+            name: '0',
+            lensDirection: CameraLensDirection.back,
+            sensorOrientation: 90,
+          ),
+          const CameraDescription(
+            name: '1',
+            lensDirection: CameraLensDirection.front,
+            sensorOrientation: 270,
+          ),
+        ]),
+        throwsA(isA<StateError>()),
+      );
+    },
+  );
 
   test(
     'wide-angle selector identifies Galaxy S23 Ultra ultra-wide camera (ID 2) using Camera2 metadata',
@@ -258,37 +261,51 @@ void main() {
       };
 
       expect(
-        () => selectWideAngleRearCameraSync(
-          cameras,
-          platformMetadata: metadata,
-        ),
+        () =>
+            selectWideAngleRearCameraSync(cameras, platformMetadata: metadata),
         throwsA(
-          predicate((e) =>
-              e is StateError &&
-              e.message.contains('No rear ultra-wide camera identified') &&
-              e.message.contains('Camera ID "0"') &&
-              e.message.contains('6.3mm')),
+          predicate(
+            (e) =>
+                e is StateError &&
+                e.message.contains('No rear ultra-wide camera identified') &&
+                e.message.contains('Camera ID "0"') &&
+                e.message.contains('6.3mm'),
+          ),
         ),
       );
     },
   );
 
-  test('manual panorama assigns eight sequential frames to one group', () {
+  test('manual panorama frames can continue across multiple groups', () {
     final fields = [
-      for (var frameIndex = 0; frameIndex < 8; frameIndex++)
-        manualPanoramaFields('panorama-1', frameIndex),
+      for (var frameIndex = 0; frameIndex < 12; frameIndex++)
+        manualPanoramaFields(
+          frameIndex < 8 ? 'panorama-1' : 'panorama-2',
+          frameIndex % 8,
+        ),
     ];
 
-    expect(fields.map((item) => item['frame_index']), [0, 1, 2, 3, 4, 5, 6, 7]);
-    expect(fields.map((item) => item['panorama_id']).toSet(), {'panorama-1'});
-    expect(fields.map((item) => item['panorama_sequence_id']).toSet(), {
+    expect(fields.take(8).map((item) => item['frame_index']), [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+    ]);
+    expect(fields.skip(8).map((item) => item['frame_index']), [0, 1, 2, 3]);
+    expect(fields.take(8).map((item) => item['panorama_id']).toSet(), {
       'panorama-1',
     });
-    expect(fields.map((item) => item['overlap_group_id']).toSet(), {
-      'panorama-1',
+    expect(fields.skip(8).map((item) => item['panorama_id']).toSet(), {
+      'panorama-2',
     });
     expect(fields.map((item) => item['is_panorama_source']).toSet(), {true});
-    expect(fields.map((item) => item['panorama_status']).toSet(), {'completed'});
+    expect(fields.map((item) => item['panorama_status']).toSet(), {
+      'completed',
+    });
   });
 
   group('gyro sweep tracking', () {
