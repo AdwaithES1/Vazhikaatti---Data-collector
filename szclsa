@@ -1,0 +1,11 @@
+* [33mfe4c04f[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m force push
+* [33mfaf4a1d[m App update 25/09
+* [33me295bd2[m Added logo
+* [33m68acd55[m Added dropdown for selecting ground truth values
+*   [33md0d6f7f[m Merge pull request #1 from AdwaithES1/add-ground-truth-fields
+[32m|[m[33m\[m  
+[32m|[m * [33mddca08b[m Add ground truth capture fields (campus, building, floor, node name)
+[32m|[m[32m/[m  
+* [33m18ca3df[m Add Flutter FastAPI synchronization
+* [33mda993ec[m seperated flutter backend and frontend
+* [33m62632aa[m initial flutter app
